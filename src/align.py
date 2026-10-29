@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import tempfile
 from typing import Any
 
 import cv2
 import numpy as np
+from numpy.lib.format import open_memmap
 from numpy.typing import NDArray
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
@@ -24,9 +26,10 @@ from config import (
     ALIGN_LOOP_TOP_K,
     ALIGN_LOOP_WINDOW_RADIUS,
     ALIGN_MIN_POINTS,
+    CHUNK_OVERLAP_SIZE,
 )
 from src.datatype import BaseFrame, Chunk, ChunkToProcess, FrameInChunk
-from src.rebuild import load_vggt_model, npz_load, rebuild_chunk
+from src.rebuild import NPZ_LOAD_KEYS, load_vggt_model, npz_load, rebuild_chunk
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +38,7 @@ logger = logging.getLogger(__name__)
 Sim3 = tuple[float, NDArray[np.floating], NDArray[np.floating]]
 LoopPair = tuple[int, int]
 LoopConstraint = tuple[int, int, Sim3]
+SKY_CLASS_ID = 2
 
 
 def detect_loop_constraints(
@@ -137,8 +141,14 @@ def estimate_loop_pair_sim3(
         chunk_id=target_chunk.chunk_id,
     )
 
-    source_to_loop = estimate_chunk_pair_sim3(source_loop, _chunk_window_to_process(source_window, source_chunk.chunk_id))
-    target_to_loop = estimate_chunk_pair_sim3(target_loop, _chunk_window_to_process(target_window, target_chunk.chunk_id))
+    source_to_loop = estimate_chunk_sequence_pair_sim3(
+        source_loop,
+        _chunk_window_to_process(source_window, source_chunk.chunk_id),
+    )
+    target_to_loop = estimate_chunk_sequence_pair_sim3(
+        target_loop,
+        _chunk_window_to_process(target_window, target_chunk.chunk_id),
+    )
     target_to_source = compose_sim3(invert_sim3(source_to_loop), target_to_loop)
     source_to_target = invert_sim3(target_to_source)
 
@@ -159,71 +169,89 @@ def extract_overlap_points(
     chunk_a: ChunkToProcess,
     chunk_b: ChunkToProcess,
 ) -> tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]]:
-    """Extract matched valid overlap points from two chunks."""
-    frame_index_a = _frame_id_to_index(chunk_a)
-    frame_index_b = _frame_id_to_index(chunk_b)
-
-    overlap_frame_ids = [
-        frame_id for frame_id in chunk_a.frame_ids if frame_id in frame_index_b
-    ]
-    if not overlap_frame_ids:
+    """Extract VGGT-Long style tail/head overlap points from adjacent chunks."""
+    overlap_count = min(CHUNK_OVERLAP_SIZE, len(chunk_a.frames), len(chunk_b.frames))
+    if overlap_count <= 0:
         return (
             np.empty((0, 3), dtype=np.float32),
             np.empty((0, 3), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
         )
 
-    points_a = np.stack(
-        [
-            chunk_a.frames[frame_index_a[frame_id]].world_points
-            for frame_id in overlap_frame_ids
-        ]
+    return _extract_frame_pair_points(
+        chunk_a.frames[-overlap_count:],
+        chunk_b.frames[:overlap_count],
+        target_chunk_id=chunk_a.chunk_id,
+        source_chunk_id=chunk_b.chunk_id,
+        log_context="VGGT-Long重叠窗口取点",
     )
-    conf_a = np.stack(
-        [
-            chunk_a.frames[frame_index_a[frame_id]].world_points_conf
-            for frame_id in overlap_frame_ids
-        ]
+
+
+def extract_sequence_pair_points(
+    chunk_a: ChunkToProcess,
+    chunk_b: ChunkToProcess,
+) -> tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]]:
+    """Extract point pairs from same-length frame sequences."""
+    pair_count = min(len(chunk_a.frames), len(chunk_b.frames))
+    if pair_count <= 0:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+
+    return _extract_frame_pair_points(
+        chunk_a.frames[:pair_count],
+        chunk_b.frames[:pair_count],
+        target_chunk_id=chunk_a.chunk_id,
+        source_chunk_id=chunk_b.chunk_id,
+        log_context="VGGT-Long逐帧窗口取点",
     )
-    points_b = np.stack(
-        [
-            chunk_b.frames[frame_index_b[frame_id]].world_points
-            for frame_id in overlap_frame_ids
-        ]
-    )
-    conf_b = np.stack(
-        [
-            chunk_b.frames[frame_index_b[frame_id]].world_points_conf
-            for frame_id in overlap_frame_ids
-        ]
-    )
+
+
+def _extract_frame_pair_points(
+    frames_a: list[FrameInChunk],
+    frames_b: list[FrameInChunk],
+    target_chunk_id: int,
+    source_chunk_id: int,
+    log_context: str,
+) -> tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]]:
+    pair_count = min(len(frames_a), len(frames_b))
+    frames_a = frames_a[:pair_count]
+    frames_b = frames_b[:pair_count]
+    if pair_count <= 0:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+
+    points_a = np.stack([frame.world_points for frame in frames_a])
+    conf_a = np.stack([frame.world_points_conf for frame in frames_a])
+    points_b = np.stack([frame.world_points for frame in frames_b])
+    conf_b = np.stack([frame.world_points_conf for frame in frames_b])
 
     conf_a = _normalize_conf_shape(conf_a, points_a)
     conf_b = _normalize_conf_shape(conf_b, points_b)
+    conf_threshold = _vggt_long_conf_threshold(conf_a, conf_b)
     sky_mask_a = np.stack(
         [
-            _frame_sky_mask_for_map(
-                chunk_a.frames[frame_index_a[frame_id]],
-                points_a.shape[1:3],
-            )
-            for frame_id in overlap_frame_ids
+            _frame_sky_mask_for_map(frame, points_a.shape[1:3])
+            for frame in frames_a
         ]
     )
     sky_mask_b = np.stack(
         [
-            _frame_sky_mask_for_map(
-                chunk_b.frames[frame_index_b[frame_id]],
-                points_b.shape[1:3],
-            )
-            for frame_id in overlap_frame_ids
+            _frame_sky_mask_for_map(frame, points_b.shape[1:3])
+            for frame in frames_b
         ]
     )
 
     valid = (
         np.isfinite(points_a).all(axis=-1)
         & np.isfinite(points_b).all(axis=-1)
-        & (conf_a > ALIGN_CONF_THRESHOLD)
-        & (conf_b > ALIGN_CONF_THRESHOLD)
+        & (conf_a > conf_threshold)
+        & (conf_b > conf_threshold)
         & ~sky_mask_a
         & ~sky_mask_b
     )
@@ -231,6 +259,16 @@ def extract_overlap_points(
     target = points_a[valid]
     source = points_b[valid]
     weights = np.sqrt(conf_a[valid] * conf_b[valid])
+    logger.info(
+        "%s: target_chunk_id=%s, source_chunk_id=%s, "
+        "frame_pair_count=%d, conf_threshold=%.6g, matched_points=%d",
+        log_context,
+        target_chunk_id,
+        source_chunk_id,
+        pair_count,
+        conf_threshold,
+        len(weights),
+    )
     return target, source, weights
 
 
@@ -276,6 +314,18 @@ def estimate_sim3(
 
     translation = mu_tgt - scale * rotation @ mu_src
     return scale, rotation, translation
+
+
+def _vggt_long_conf_threshold(
+    conf_a: NDArray[np.floating],
+    conf_b: NDArray[np.floating],
+) -> float:
+    """Match VGGT-Long's dynamic confidence threshold for point-map alignment."""
+    finite_a = conf_a[np.isfinite(conf_a)]
+    finite_b = conf_b[np.isfinite(conf_b)]
+    if finite_a.size == 0 or finite_b.size == 0:
+        return ALIGN_CONF_THRESHOLD
+    return float(min(np.median(finite_a), np.median(finite_b)) * 0.1)
 
 
 def robust_estimate_sim3(
@@ -346,6 +396,21 @@ def estimate_chunk_pair_sim3(
     if len(weights) < ALIGN_MIN_POINTS:
         raise ValueError(
             f"not enough valid overlap points: got {len(weights)}, "
+            f"need at least {ALIGN_MIN_POINTS}"
+        )
+
+    return robust_estimate_sim3(source, target, weights)
+
+
+def estimate_chunk_sequence_pair_sim3(
+    chunk_a: ChunkToProcess,
+    chunk_b: ChunkToProcess,
+) -> Sim3:
+    """Estimate chunk_b -> chunk_a Sim3 from same-length frame windows."""
+    target, source, weights = extract_sequence_pair_points(chunk_a, chunk_b)
+    if len(weights) < ALIGN_MIN_POINTS:
+        raise ValueError(
+            f"not enough valid paired-window points: got {len(weights)}, "
             f"need at least {ALIGN_MIN_POINTS}"
         )
 
@@ -561,9 +626,9 @@ def align_npz_files(
     device: str | None = None,
 ) -> Path:
     """Load chunk npz files, align them, and save one concatenated npz file."""
-    chunks = [npz_load(npz_path) for npz_path in npz_paths]
-    return save_aligned_chunks_npz(
-        chunks,
+    paths = [Path(npz_path) for npz_path in npz_paths]
+    return save_aligned_npz_files_streaming(
+        paths,
         output_path,
         loop_pairs=loop_pairs,
         enable_loop=enable_loop,
@@ -592,6 +657,247 @@ def align(
         loop_model_name_or_path=loop_model_name_or_path,
         device=device,
     )
+
+
+def save_aligned_npz_files_streaming(
+    npz_paths: list[str | Path],
+    output_path: str | Path,
+    loop_pairs: list[LoopPair] | None = None,
+    enable_loop: bool = ALIGN_LOOP_ENABLE,
+    loop_model: Any | None = None,
+    loop_model_name_or_path: str = ALIGN_LOOP_MODEL_NAME_OR_PATH,
+    device: str | None = None,
+) -> Path:
+    """Align chunk npz files and stream the merged arrays through npy memmaps."""
+    paths = [Path(npz_path) for npz_path in npz_paths]
+    if not paths:
+        raise ValueError("no npz files to align")
+
+    transforms = estimate_npz_file_transforms(
+        paths,
+        loop_pairs=loop_pairs,
+        enable_loop=enable_loop,
+        loop_model=loop_model,
+        loop_model_name_or_path=loop_model_name_or_path,
+        device=device,
+    )
+    return write_aligned_npz_files_streaming(paths, transforms, output_path)
+
+
+def estimate_npz_file_transforms(
+    npz_paths: list[str | Path],
+    loop_pairs: list[LoopPair] | None = None,
+    enable_loop: bool = ALIGN_LOOP_ENABLE,
+    loop_model: Any | None = None,
+    loop_model_name_or_path: str = ALIGN_LOOP_MODEL_NAME_OR_PATH,
+    device: str | None = None,
+) -> list[Sim3]:
+    """Estimate absolute chunk transforms while loading only needed chunks."""
+    paths = [Path(npz_path) for npz_path in npz_paths]
+    if not paths:
+        return []
+    if len(paths) == 1:
+        return [_identity_sim3()]
+
+    adjacent_transforms: list[Sim3] = []
+    previous_chunk = npz_load(paths[0])
+    for index, path in enumerate(paths[1:]):
+        current_chunk = npz_load(path)
+        transform = estimate_chunk_pair_sim3(previous_chunk, current_chunk)
+        adjacent_transforms.append(transform)
+        logger.info(
+            "每组分块拼接完成: source_chunk_id=%s, target_chunk_id=%s, transform_matrix=%s",
+            current_chunk.chunk_id,
+            previous_chunk.chunk_id,
+            np.array2string(_sim3_to_matrix(transform), precision=6, suppress_small=False),
+        )
+        previous_chunk = current_chunk
+
+    if enable_loop:
+        loop_constraints = estimate_loop_constraints_from_npz_files(
+            paths,
+            loop_pairs,
+            model=loop_model,
+            model_name_or_path=loop_model_name_or_path,
+            device=device,
+        )
+        if loop_constraints:
+            adjacent_transforms = optimize_sim3_pose_graph(
+                adjacent_transforms,
+                loop_constraints,
+            )
+            logger.info("回环全局优化完成: loop_constraint_count=%d", len(loop_constraints))
+        else:
+            logger.info("未找到可靠回环约束，使用顺序拼接结果")
+
+    return [_identity_sim3(), *accumulate_sim3_transforms(adjacent_transforms)]
+
+
+def estimate_loop_constraints_from_npz_files(
+    npz_paths: list[str | Path],
+    candidate_pairs: list[LoopPair] | None = None,
+    model: Any | None = None,
+    model_name_or_path: str = ALIGN_LOOP_MODEL_NAME_OR_PATH,
+    device: str | None = None,
+) -> list[LoopConstraint]:
+    """Estimate loop constraints by loading only the two chunks needed per pair."""
+    paths = [Path(npz_path) for npz_path in npz_paths]
+    if len(paths) < 3:
+        return []
+
+    if candidate_pairs is None:
+        probe_chunks = [_load_npz_probe_chunk(path) for path in paths]
+        candidate_pairs = _find_loop_candidate_pairs(probe_chunks)
+    if not candidate_pairs:
+        return []
+
+    if model is None:
+        model = load_vggt_model(model_name_or_path=model_name_or_path, device=device)
+
+    constraints: list[LoopConstraint] = []
+    for source_index, target_index in candidate_pairs:
+        if source_index == target_index:
+            continue
+        if source_index < target_index:
+            source_index, target_index = target_index, source_index
+        if source_index >= len(paths) or target_index < 0:
+            continue
+        if source_index - target_index < ALIGN_LOOP_MIN_CHUNK_GAP:
+            continue
+
+        source_chunk = npz_load(paths[source_index])
+        target_chunk = npz_load(paths[target_index])
+        try:
+            transform = estimate_loop_pair_sim3(
+                source_chunk,
+                target_chunk,
+                model=model,
+                device=device,
+            )
+        except ValueError as exc:
+            logger.debug(
+                "跳过回环约束: source_chunk_id=%s, target_chunk_id=%s, reason=%s",
+                source_chunk.chunk_id,
+                target_chunk.chunk_id,
+                exc,
+            )
+            continue
+
+        constraints.append((source_index, target_index, transform))
+        logger.info(
+            "回环约束估计完成: source_chunk_id=%s, target_chunk_id=%s, transform_matrix=%s",
+            source_chunk.chunk_id,
+            target_chunk.chunk_id,
+            np.array2string(_sim3_to_matrix(transform), precision=6, suppress_small=False),
+        )
+        if len(constraints) >= ALIGN_LOOP_MAX_PAIRS:
+            break
+
+    return constraints
+
+
+def write_aligned_npz_files_streaming(
+    npz_paths: list[str | Path],
+    transforms: list[Sim3],
+    output_path: str | Path,
+) -> Path:
+    """Stream transformed chunks into a VGGT-style aligned npz file."""
+    paths = [Path(npz_path) for npz_path in npz_paths]
+    if len(paths) != len(transforms):
+        raise ValueError(
+            f"npz_paths length {len(paths)} does not match transforms length {len(transforms)}"
+        )
+    if not paths:
+        raise ValueError("no npz files to write")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = _collect_stream_npz_metadata(paths)
+    frame_count = len(metadata["frame_ids"])
+    if frame_count == 0:
+        raise ValueError("no frames to save")
+
+    with tempfile.TemporaryDirectory(prefix=f"{output_path.stem}_memmap_", dir=output_path.parent) as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        arrays: dict[str, Any] = {
+            "world_points_from_depth": open_memmap(
+                tmp_path / "world_points_from_depth.npy",
+                mode="w+",
+                dtype=metadata["world_points_dtype"],
+                shape=(frame_count, *metadata["world_points_shape"]),
+            ),
+            "depth_conf": open_memmap(
+                tmp_path / "depth_conf.npy",
+                mode="w+",
+                dtype=metadata["confidence_dtype"],
+                shape=(frame_count, *metadata["confidence_shape"]),
+            ),
+            "images": open_memmap(
+                tmp_path / "images.npy",
+                mode="w+",
+                dtype=metadata["image_dtype"],
+                shape=(frame_count, *metadata["image_shape"]),
+            ),
+            "masks": open_memmap(
+                tmp_path / "masks.npy",
+                mode="w+",
+                dtype=metadata["mask_dtype"],
+                shape=(frame_count, *metadata["mask_shape"]),
+            ),
+            "point_labels": open_memmap(
+                tmp_path / "point_labels.npy",
+                mode="w+",
+                dtype=metadata["mask_dtype"],
+                shape=(frame_count, *metadata["mask_shape"]),
+            ),
+        }
+        frame_offset = 0
+        seen_frame_ids: set[int] = set()
+        for path, transform in zip(paths, transforms):
+            chunk = npz_load(path)
+            scale, rotation, translation = transform
+            for frame in chunk.frames:
+                if frame.id in seen_frame_ids:
+                    continue
+                seen_frame_ids.add(frame.id)
+                aligned_points = apply_sim3_to_points(
+                    frame.world_points,
+                    scale,
+                    rotation,
+                    translation,
+                ).astype(metadata["world_points_dtype"], copy=False)
+                confidence = np.asarray(frame.world_points_conf)
+                sky_mask = _frame_sky_mask_for_map(frame, aligned_points.shape[:2])
+                filtered_confidence = np.where(sky_mask, 0, confidence).astype(
+                    metadata["confidence_dtype"],
+                    copy=False,
+                )
+                arrays["world_points_from_depth"][frame_offset] = aligned_points
+                arrays["depth_conf"][frame_offset] = filtered_confidence
+                arrays["images"][frame_offset] = frame.image
+                arrays["masks"][frame_offset] = frame.mask
+                arrays["point_labels"][frame_offset] = frame.mask
+                frame_offset += 1
+
+        if frame_offset != frame_count:
+            raise ValueError(f"expected {frame_count} unique frames, wrote {frame_offset}")
+
+        for value in arrays.values():
+            value.flush()
+        arrays.update(
+            {
+                "pose_enc": np.empty((frame_count, 0), dtype=np.float32),
+                "depth": np.zeros((frame_count, *metadata["confidence_shape"]), dtype=np.float32),
+                "extrinsic": _identity_extrinsics(frame_count),
+                "intrinsic": _identity_intrinsics(frame_count),
+                "chunk_id": np.array(metadata["chunk_id"]),
+                "frame_ids": np.array(metadata["frame_ids"], dtype=np.int64),
+                "gps_locations": np.array(metadata["gps_locations"], dtype=np.float64),
+            }
+        )
+        np.savez(output_path, **arrays)
+
+    return output_path
 
 
 def align_chunks(
@@ -716,6 +1022,41 @@ def _find_loop_candidate_pairs(chunks: list[ChunkToProcess]) -> list[LoopPair]:
         (source_index, target_index)
         for _, source_index, target_index in scored_pairs[:ALIGN_LOOP_MAX_PAIRS]
     ]
+
+
+def _load_npz_probe_chunk(npz_path: str | Path) -> ChunkToProcess:
+    """Load only first/middle/last frames from a chunk npz for loop scoring."""
+    npz_path = Path(npz_path)
+    with np.load(npz_path) as loaded:
+        missing_keys = [key for key in ("images", "chunk_id", "frame_ids", "gps_locations") if key not in loaded.files]
+        if missing_keys:
+            raise KeyError(f"{npz_path} is missing loop probe keys: {missing_keys}")
+
+        frame_ids = np.asarray(loaded["frame_ids"])
+        if frame_ids.size == 0:
+            return ChunkToProcess(chunk_id=int(np.asarray(loaded["chunk_id"]).item()))
+        indexes = sorted({0, int(frame_ids.size // 2), int(frame_ids.size - 1)})
+        images = np.asarray(loaded["images"][indexes])
+        gps_locations = np.asarray(loaded["gps_locations"][indexes])
+        masks = np.asarray(loaded["masks"][indexes]) if "masks" in loaded.files else None
+        chunk_id = int(np.asarray(loaded["chunk_id"]).item())
+
+    chunk = ChunkToProcess(chunk_id=chunk_id, frames=[], frame_ids=[])
+    empty_points = np.empty((0, 0, 3), dtype=np.float32)
+    empty_conf = np.empty((0, 0), dtype=np.float32)
+    for output_index, frame_index in enumerate(indexes):
+        chunk.add_frame(
+            FrameInChunk(
+                id=int(frame_ids[frame_index]),
+                image=images[output_index],
+                gps_location=tuple(gps_locations[output_index]),
+                mask=None if masks is None else masks[output_index],
+                chunk_id=chunk_id,
+                world_points=empty_points,
+                world_points_conf=empty_conf,
+            )
+        )
+    return chunk
 
 
 def _chunk_visual_score(chunk_a: ChunkToProcess, chunk_b: ChunkToProcess) -> float:
@@ -985,10 +1326,10 @@ def _mask_to_map_sky_mask(
     map_shape: tuple[int, int],
 ) -> NDArray[np.bool_]:
     mask_array = _mask_to_hwc(mask)
-    if not np.any(mask_array):
+    if not np.any(mask_array == SKY_CLASS_ID):
         return np.zeros(map_shape, dtype=bool)
 
-    sky_mask = np.any(mask_array > 0, axis=2)
+    sky_mask = np.any(mask_array == SKY_CLASS_ID, axis=2)
     image_h, image_w = image_shape
     if sky_mask.shape != (image_h, image_w):
         sky_mask = cv2.resize(
@@ -1090,6 +1431,7 @@ def _chunks_to_npz_predictions(chunks: list[ChunkToProcess]) -> dict[str, Any]:
         "depth_conf": depth_conf,
         "images": images,
         "masks": masks,
+        "point_labels": masks,
         "pose_enc": np.empty((frame_count, 0), dtype=np.float32),
         "depth": np.zeros(depth_conf.shape, dtype=np.float32),
         "extrinsic": _identity_extrinsics(frame_count),
@@ -1097,9 +1439,92 @@ def _chunks_to_npz_predictions(chunks: list[ChunkToProcess]) -> dict[str, Any]:
         "chunk_id": np.array(chunks[0].chunk_id if chunks else -1),
         "frame_ids": frame_ids,
         "gps_locations": gps_locations,
-        "world_points": world_points,
-        "world_points_conf": depth_conf,
     }
+
+
+def _collect_stream_npz_metadata(paths: list[Path]) -> dict[str, Any]:
+    frame_ids: list[int] = []
+    gps_locations: list[tuple[float, float, float]] = []
+    seen_frame_ids: set[int] = set()
+    chunk_id: int | None = None
+    world_points_shape: tuple[int, ...] | None = None
+    confidence_shape: tuple[int, ...] | None = None
+    image_shape: tuple[int, ...] | None = None
+    mask_shape: tuple[int, ...] | None = None
+    world_points_dtype: np.dtype[Any] | None = None
+    confidence_dtype: np.dtype[Any] | None = None
+    image_dtype: np.dtype[Any] | None = None
+    mask_dtype: np.dtype[Any] | None = None
+
+    for path in paths:
+        with np.load(path) as loaded:
+            missing_keys = [key for key in NPZ_LOAD_KEYS if key not in loaded.files]
+            if missing_keys:
+                raise KeyError(f"{path} is missing ChunkToProcess keys: {missing_keys}")
+            if "masks" not in loaded.files:
+                raise KeyError(f"{path} is missing masks")
+
+            if chunk_id is None:
+                chunk_id = int(np.asarray(loaded["chunk_id"]).item())
+                world_points_shape = tuple(loaded["world_points_from_depth"].shape[1:])
+                confidence_shape = tuple(loaded["depth_conf"].shape[1:])
+                image_shape = tuple(loaded["images"].shape[1:])
+                mask_shape = tuple(loaded["masks"].shape[1:])
+                world_points_dtype = loaded["world_points_from_depth"].dtype
+                confidence_dtype = loaded["depth_conf"].dtype
+                image_dtype = loaded["images"].dtype
+                mask_dtype = loaded["masks"].dtype
+
+            _assert_stream_array_compatible(path, "world_points_from_depth", loaded["world_points_from_depth"], world_points_shape, world_points_dtype)
+            _assert_stream_array_compatible(path, "depth_conf", loaded["depth_conf"], confidence_shape, confidence_dtype)
+            _assert_stream_array_compatible(path, "images", loaded["images"], image_shape, image_dtype)
+            _assert_stream_array_compatible(path, "masks", loaded["masks"], mask_shape, mask_dtype)
+
+            loaded_frame_ids = np.asarray(loaded["frame_ids"])
+            loaded_gps = np.asarray(loaded["gps_locations"])
+            for index, frame_id in enumerate(loaded_frame_ids):
+                frame_id_int = int(frame_id)
+                if frame_id_int in seen_frame_ids:
+                    continue
+                seen_frame_ids.add(frame_id_int)
+                frame_ids.append(frame_id_int)
+                gps = loaded_gps[index]
+                gps_locations.append(
+                    (
+                        float(gps[0]) if gps.size > 0 else float("nan"),
+                        float(gps[1]) if gps.size > 1 else float("nan"),
+                        float(gps[2]) if gps.size > 2 else float("nan"),
+                    )
+                )
+
+    return {
+        "chunk_id": -1 if chunk_id is None else chunk_id,
+        "frame_ids": frame_ids,
+        "gps_locations": gps_locations,
+        "world_points_shape": world_points_shape,
+        "confidence_shape": confidence_shape,
+        "image_shape": image_shape,
+        "mask_shape": mask_shape,
+        "world_points_dtype": world_points_dtype,
+        "confidence_dtype": confidence_dtype,
+        "image_dtype": image_dtype,
+        "mask_dtype": mask_dtype,
+    }
+
+
+def _assert_stream_array_compatible(
+    path: Path,
+    key: str,
+    value: NDArray[Any],
+    expected_shape: tuple[int, ...] | None,
+    expected_dtype: np.dtype[Any] | None,
+) -> None:
+    if expected_shape is not None and tuple(value.shape[1:]) != expected_shape:
+        raise ValueError(
+            f"{path} {key} trailing shape {value.shape[1:]} does not match {expected_shape}"
+        )
+    if expected_dtype is not None and value.dtype != expected_dtype:
+        raise ValueError(f"{path} {key} dtype {value.dtype} does not match {expected_dtype}")
 
 
 def _identity_extrinsics(frame_count: int) -> NDArray[np.float32]:

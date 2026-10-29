@@ -18,8 +18,11 @@ from config import (
     ALIGN_LOOP_TOP_K,
     ALIGN_LOOP_WINDOW_RADIUS,
     ALIGN_MIN_POINTS,
+    ALIGN_PLY_CONF_THRES,
     CHUNK_OVERLAP_SIZE,
     CHUNK_SIZE,
+    EXPORT_GLB_ENABLE,
+    EXPORT_PLY_ENABLE,
     IMAGE_SAMPLE_INTERVAL,
     IMAGE_SEGMENT_SIZE,
     KEY_FRAME_DELETE_RATIO,
@@ -34,6 +37,10 @@ from config import (
     REMOVE_MASK_MEAN,
     REMOVE_MASK_MODEL_PATH,
     REMOVE_MASK_STD,
+    POINTCLOUD_DOWNSAMPLE_ENABLE,
+    POINTCLOUD_DOWNSAMPLE_MIN_KEEP_RATIO,
+    POINTCLOUD_DOWNSAMPLE_SUFFIX,
+    POINTCLOUD_DOWNSAMPLE_VOXEL_SIZE,
     VIDEO_EXTRACT_FPS,
     VIDEO_SEGMENT_SECONDS,
 )
@@ -61,7 +68,13 @@ def run_pipeline(
     remove_mask_model_path: str | Path = REMOVE_MASK_MODEL_PATH,
     remove_mask_device: str | None = REMOVE_MASK_DEVICE,
     remove_mask_class_ids: tuple[int, ...] = REMOVE_MASK_CLASS_IDS,
+    export_glb_enable: bool = EXPORT_GLB_ENABLE,
+    export_ply_enable: bool = EXPORT_PLY_ENABLE,
     align_glb_conf_thres: float = ALIGN_GLB_CONF_THRES,
+    align_ply_conf_thres: float = ALIGN_PLY_CONF_THRES,
+    pointcloud_downsample_enable: bool = POINTCLOUD_DOWNSAMPLE_ENABLE,
+    pointcloud_downsample_voxel_size: float = POINTCLOUD_DOWNSAMPLE_VOXEL_SIZE,
+    pointcloud_downsample_min_keep_ratio: float = POINTCLOUD_DOWNSAMPLE_MIN_KEEP_RATIO,
 ) -> Path:
     """Run preprocess, rebuild, and align workflows for one input."""
     input_path = Path(input_path)
@@ -100,7 +113,13 @@ def run_pipeline(
             glb_path = run_align_and_merge(
                 storage_dir=task_dir,
                 chunk_count=len(chunks),
+                export_glb_enable=export_glb_enable,
+                export_ply_enable=export_ply_enable,
                 conf_thres=align_glb_conf_thres,
+                ply_conf_thres=align_ply_conf_thres,
+                pointcloud_downsample_enable=pointcloud_downsample_enable,
+                pointcloud_downsample_voxel_size=pointcloud_downsample_voxel_size,
+                pointcloud_downsample_min_keep_ratio=pointcloud_downsample_min_keep_ratio,
                 summary_steps=step_summaries,
             )
         step_summaries.append(step_monitor.summary())
@@ -120,7 +139,13 @@ def run_pipeline(
             remove_mask_model_path=remove_mask_model_path,
             remove_mask_device=remove_mask_device,
             remove_mask_class_ids=remove_mask_class_ids,
+            export_glb_enable=export_glb_enable,
+            export_ply_enable=export_ply_enable,
             align_glb_conf_thres=align_glb_conf_thres,
+            align_ply_conf_thres=align_ply_conf_thres,
+            pointcloud_downsample_enable=pointcloud_downsample_enable,
+            pointcloud_downsample_voxel_size=pointcloud_downsample_voxel_size,
+            pointcloud_downsample_min_keep_ratio=pointcloud_downsample_min_keep_ratio,
         ),
         steps=step_summaries,
         total=total_monitor.summary(),
@@ -142,7 +167,13 @@ def _build_summary_parameters(
     remove_mask_model_path: str | Path,
     remove_mask_device: str | None,
     remove_mask_class_ids: tuple[int, ...],
+    export_glb_enable: bool,
+    export_ply_enable: bool,
     align_glb_conf_thres: float,
+    align_ply_conf_thres: float,
+    pointcloud_downsample_enable: bool,
+    pointcloud_downsample_voxel_size: float,
+    pointcloud_downsample_min_keep_ratio: float,
 ) -> dict[str, object]:
     return {
         "input_path": str(input_path),
@@ -169,13 +200,21 @@ def _build_summary_parameters(
         "rebuild_device": None,
         "align_output_npz_name": "aligned.npz",
         "align_output_glb_name": "aligned.glb",
+        "align_output_ply_name": "aligned.ply",
+        "export_glb_enable": export_glb_enable,
+        "export_ply_enable": export_ply_enable,
         "align_glb_conf_thres": align_glb_conf_thres,
+        "align_ply_conf_thres": align_ply_conf_thres,
+        "pointcloud_downsample_enable": pointcloud_downsample_enable,
+        "pointcloud_downsample_voxel_size": pointcloud_downsample_voxel_size,
+        "pointcloud_downsample_min_keep_ratio": pointcloud_downsample_min_keep_ratio,
+        "pointcloud_downsample_suffix": POINTCLOUD_DOWNSAMPLE_SUFFIX,
         "align_filter_by_frames": "all",
         "align_mask_black_bg": False,
         "align_mask_white_bg": False,
         "align_show_cam": False,
         "align_mask_sky": False,
-        "align_prediction_mode": "Predicted Pointmap",
+        "align_prediction_mode": "Depthmap and Camera Branch",
         "align_conf_threshold": ALIGN_CONF_THRESHOLD,
         "align_irls_delta": ALIGN_IRLS_DELTA,
         "align_irls_max_iters": ALIGN_IRLS_MAX_ITERS,
@@ -224,24 +263,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-remove-mask",
         action="store_true",
-        help="Disable BiSeNetV2 remove-mask generation after chunk saving.",
+        help="Disable SegFormer semantic mask generation after chunk saving.",
     )
     parser.add_argument(
         "--remove-mask-model-path",
         default=REMOVE_MASK_MODEL_PATH,
-        help=f"BiSeNetV2 model path. Default: {REMOVE_MASK_MODEL_PATH}",
+        help=f"SegFormer model name or local path. Default: {REMOVE_MASK_MODEL_PATH}",
     )
     parser.add_argument(
         "--remove-mask-device",
         default=REMOVE_MASK_DEVICE,
-        help="Device for BiSeNetV2 remove-mask inference, such as cuda or cpu.",
+        help="Device for SegFormer mask inference, such as cuda or cpu.",
     )
     parser.add_argument(
         "--remove-mask-class-ids",
         type=int,
         nargs="+",
         default=REMOVE_MASK_CLASS_IDS,
-        help=f"Remove class ids in BiSeNetV2 output. Default: {REMOVE_MASK_CLASS_IDS}",
+        help=f"Sky class ids in SegFormer output. Default: {REMOVE_MASK_CLASS_IDS}",
     )
     parser.add_argument(
         "--align-glb-conf-thres",
@@ -250,6 +289,47 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Final GLB confidence percentile threshold. "
             f"Default: {ALIGN_GLB_CONF_THRES}"
+        ),
+    )
+    parser.add_argument(
+        "--no-export-glb",
+        action="store_true",
+        default=not EXPORT_GLB_ENABLE,
+        help=f"Disable final GLB export. Default enabled: {EXPORT_GLB_ENABLE}",
+    )
+    parser.add_argument(
+        "--align-ply-conf-thres",
+        type=float,
+        default=ALIGN_PLY_CONF_THRES,
+        help=(
+            "Final PLY confidence percentile threshold. "
+            f"Default: {ALIGN_PLY_CONF_THRES}"
+        ),
+    )
+    parser.add_argument(
+        "--no-export-ply",
+        action="store_true",
+        default=not EXPORT_PLY_ENABLE,
+        help=f"Disable final PLY export. Default enabled: {EXPORT_PLY_ENABLE}",
+    )
+    parser.add_argument(
+        "--no-pointcloud-downsample",
+        action="store_true",
+        help="Disable final downsampled GLB/PLY export.",
+    )
+    parser.add_argument(
+        "--pointcloud-downsample-voxel-size",
+        type=float,
+        default=POINTCLOUD_DOWNSAMPLE_VOXEL_SIZE,
+        help=f"Voxel grid size. Default: {POINTCLOUD_DOWNSAMPLE_VOXEL_SIZE}",
+    )
+    parser.add_argument(
+        "--pointcloud-downsample-min-keep-ratio",
+        type=float,
+        default=POINTCLOUD_DOWNSAMPLE_MIN_KEEP_RATIO,
+        help=(
+            "Minimum point ratio to keep after voxel downsampling. "
+            f"Default: {POINTCLOUD_DOWNSAMPLE_MIN_KEEP_RATIO}"
         ),
     )
     return parser.parse_args()
@@ -268,7 +348,13 @@ def main() -> None:
         remove_mask_model_path=args.remove_mask_model_path,
         remove_mask_device=args.remove_mask_device,
         remove_mask_class_ids=tuple(args.remove_mask_class_ids),
+        export_glb_enable=not args.no_export_glb,
+        export_ply_enable=not args.no_export_ply,
         align_glb_conf_thres=args.align_glb_conf_thres,
+        align_ply_conf_thres=args.align_ply_conf_thres,
+        pointcloud_downsample_enable=not args.no_pointcloud_downsample,
+        pointcloud_downsample_voxel_size=args.pointcloud_downsample_voxel_size,
+        pointcloud_downsample_min_keep_ratio=args.pointcloud_downsample_min_keep_ratio,
     )
     print(glb_path)
 

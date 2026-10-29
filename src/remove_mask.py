@@ -10,9 +10,11 @@ from urllib.request import urlretrieve
 import cv2
 import numpy as np
 from numpy.typing import NDArray
+from PIL import Image
 import torch
 
 from config import (
+    configure_huggingface_endpoint,
     REMOVE_MASK_CLASS_IDS,
     REMOVE_MASK_DEVICE,
     REMOVE_MASK_MEAN,
@@ -24,23 +26,31 @@ from config import (
 )
 from src.datatype import Chunk
 
+configure_huggingface_endpoint()
+
+from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
+
 
 logger = logging.getLogger(__name__)
+SEGFORMER_MODEL_NAME = "nvidia/segformer-b5-finetuned-ade-640-640"
+SKY_CLASS_ID = 2
 
 
 def load_sky_segmentation_model(
     model_path: str | Path = REMOVE_MASK_MODEL_PATH,
     device: str | torch.device | None = REMOVE_MASK_DEVICE,
 ) -> torch.nn.Module:
-    """Load a runnable BiSeNetV2 sky segmentation model."""
+    """Load a runnable SegFormer MiT-B5 ADE20K semantic segmentation model."""
     resolved_device = _resolve_device(device)
-    model = _load_custom_segmentation_model(model_path, resolved_device)
+    model_name_or_path = str(model_path or SEGFORMER_MODEL_NAME)
+    model = SegformerForSemanticSegmentation.from_pretrained(model_name_or_path)
+    model.processor = AutoImageProcessor.from_pretrained(model_name_or_path)
 
     model = model.to(resolved_device)
     model.eval()
     logger.info(
-        "BiSeNetV2天空分割模型加载完成: model_path=%s, device=%s",
-        model_path,
+        "SegFormer MiT-B5语义分割模型加载完成: model_name_or_path=%s, device=%s",
+        model_name_or_path,
         resolved_device,
     )
     return model
@@ -50,7 +60,7 @@ def load_bisenetv2_model(
     model_path: str | Path = REMOVE_MASK_MODEL_PATH,
     device: str | torch.device | None = REMOVE_MASK_DEVICE,
 ) -> torch.nn.Module:
-    """Load a runnable BiSeNetV2 sky segmentation model."""
+    """Backward-compatible SegFormer loader."""
     return load_sky_segmentation_model(model_path=model_path, device=device)
 
 
@@ -58,7 +68,7 @@ def load_remove_mask_model(
     model_path: str | Path = REMOVE_MASK_MODEL_PATH,
     device: str | torch.device | None = REMOVE_MASK_DEVICE,
 ) -> torch.nn.Module:
-    """Load a runnable BiSeNetV2 remove-mask segmentation model."""
+    """Load a runnable SegFormer semantic segmentation model."""
     return load_sky_segmentation_model(model_path=model_path, device=device)
 
 
@@ -196,7 +206,7 @@ def add_sky_masks_to_chunk_files(
     model: torch.nn.Module | None = None,
     model_path: str | Path = REMOVE_MASK_MODEL_PATH,
     device: str | torch.device | None = REMOVE_MASK_DEVICE,
-    sky_class_id: int = 10,
+    sky_class_id: int = SKY_CLASS_ID,
 ) -> list[Chunk]:
     """Backward-compatible wrapper for previous sky-mask calls."""
     return add_remove_masks_to_chunk_files(
@@ -214,17 +224,16 @@ def apply_remove_masks_to_chunk(
     device: str | torch.device | None = REMOVE_MASK_DEVICE,
     remove_class_ids: tuple[int, ...] = REMOVE_MASK_CLASS_IDS,
 ) -> Chunk:
-    """Run BiSeNetV2 on every frame and store the remove mask in frame.mask."""
+    """Run SegFormer on every frame and store the class-label map in frame.mask."""
     resolved_device = _resolve_device(device)
     model = model.to(resolved_device)
     model.eval()
 
     for frame in chunk.frames:
-        frame.mask = predict_remove_mask(
+        frame.mask = predict_class_label_mask(
             frame.image,
             model=model,
             device=resolved_device,
-            remove_class_ids=remove_class_ids,
         )
 
     return chunk
@@ -234,7 +243,7 @@ def apply_sky_masks_to_chunk(
     chunk: Chunk,
     model: torch.nn.Module,
     device: str | torch.device | None = REMOVE_MASK_DEVICE,
-    sky_class_id: int = 10,
+    sky_class_id: int = SKY_CLASS_ID,
 ) -> Chunk:
     """Backward-compatible wrapper for previous sky-mask calls."""
     return apply_remove_masks_to_chunk(
@@ -251,41 +260,47 @@ def predict_remove_mask(
     device: str | torch.device | None = REMOVE_MASK_DEVICE,
     remove_class_ids: tuple[int, ...] = REMOVE_MASK_CLASS_IDS,
 ) -> NDArray[np.uint8]:
-    """Return a uint8 remove mask with the same shape as image."""
+    """Return a uint8 class-label map with the same height/width as image."""
+    return predict_class_label_mask(image, model=model, device=device)
+
+
+def predict_class_label_mask(
+    image: NDArray[np.uint8],
+    model: torch.nn.Module,
+    device: str | torch.device | None = REMOVE_MASK_DEVICE,
+) -> NDArray[np.uint8]:
+    """Return a SegFormer ADE20K class-label map for every image pixel."""
     image = _ensure_rgb_image(image)
     resolved_device = _resolve_device(device)
-    padded_image, original_shape = _pad_image_to_multiple(image, multiple=32)
-    input_tensor = _image_to_input_tensor(padded_image).to(resolved_device)
+    processor = getattr(model, "processor", None)
+    if processor is None:
+        raise AttributeError("SegFormer model is missing its AutoImageProcessor")
+
+    pil_image = Image.fromarray(image)
+    inputs = processor(images=pil_image, return_tensors="pt")
+    inputs = {key: value.to(resolved_device) for key, value in inputs.items()}
 
     with torch.no_grad():
-        output = model(input_tensor)
+        output = model(**inputs)
 
     logits = _extract_logits(output)
     logits = torch.nn.functional.interpolate(
         logits,
-        size=padded_image.shape[:2],
+        size=image.shape[:2],
         mode="bilinear",
         align_corners=False,
     )
-    classes = torch.argmax(logits, dim=1)[0].detach().cpu().numpy()
-    classes = classes[: original_shape[0], : original_shape[1]]
-    remove_mask = np.isin(classes, remove_class_ids).astype(np.uint8) * np.uint8(255)
-    return np.repeat(remove_mask[:, :, None], image.shape[2], axis=2)
+    return torch.argmax(logits, dim=1)[0].detach().cpu().numpy().astype(np.uint8)
 
 
 def predict_sky_mask(
     image: NDArray[np.uint8],
     model: torch.nn.Module,
     device: str | torch.device | None = REMOVE_MASK_DEVICE,
-    sky_class_id: int = 10,
+    sky_class_id: int = SKY_CLASS_ID,
 ) -> NDArray[np.uint8]:
-    """Backward-compatible wrapper for previous sky-mask calls."""
-    return predict_remove_mask(
-        image,
-        model=model,
-        device=device,
-        remove_class_ids=(sky_class_id,),
-    )
+    """Return a binary sky mask for compatibility with previous sky-mask calls."""
+    return (predict_class_label_mask(image, model=model, device=device) == sky_class_id).astype(np.uint8) * 255
 
 
 def load_chunk_pickle(chunk_path: str | Path) -> Chunk:

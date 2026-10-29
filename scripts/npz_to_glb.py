@@ -52,8 +52,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--prediction-mode",
-        default="Predicted Pointmap",
-        choices=["Predicted Pointmap", "Depthmap and Camera Branch"],
+        default="Depthmap and Camera Branch",
+        choices=["Depthmap and Camera Branch"],
         help="Prediction branch used by VGGT visualization.",
     )
     args = parser.parse_args()

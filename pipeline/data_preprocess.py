@@ -6,6 +6,8 @@ from pathlib import Path
 import pickle
 from contextlib import contextmanager
 
+import cv2
+
 from config import (
     IMAGE_SAMPLE_INTERVAL,
     IMAGE_SEGMENT_SIZE,
@@ -17,11 +19,15 @@ from config import (
     REMOVE_MASK_ENABLE,
     REMOVE_MASK_MODEL_PATH,
 )
-from src.datatype import Chunk
+from src.datatype import BaseFrame, Chunk, OriginalFrames
 from src.frame_chunk import split_original_frames_into_chunks
 from src.image_load import iter_original_frame_segments_from_image
-from src.image_preprocess import preprocess_original_frames
-from src.key_frame_select import select_key_frames
+from src.image_preprocess import preprocess_original_frame
+from src.key_frame_select import (
+    FrameMetadata,
+    build_frame_metadata,
+    select_key_frame_metadata,
+)
 from src.logging_utils import configure_logging, configure_task_file_logging
 from src.remove_mask import add_remove_masks_to_chunk_files, load_remove_mask_model
 from src.task_summary import ResourceStepMonitor, StepSummary
@@ -29,6 +35,8 @@ from src.video_load import iter_original_frame_segments_from_video
 
 
 logger = logging.getLogger(__name__)
+
+PREPROCESSED_FRAME_DIR_NAME = "preprocessed_frames"
 
 
 def run_data_preprocess(
@@ -77,6 +85,8 @@ def run_data_preprocess_with_task_dir(
     task_dir = Path(result_dir) / task_id
     log_path = configure_task_file_logging(task_dir)
     logger.info("任务日志文件: %s", log_path)
+    preprocessed_frame_dir = task_dir / PREPROCESSED_FRAME_DIR_NAME
+    preprocessed_frame_dir.mkdir(parents=True, exist_ok=True)
     frame_segments = iter(_iter_original_frame_segments(
         input_path,
         read_type,
@@ -92,7 +102,12 @@ def run_data_preprocess_with_task_dir(
     effective_remove_mask_class_ids = (
         remove_mask_class_ids if remove_mask_class_ids is not None else REMOVE_MASK_CLASS_IDS
     )
+    metadata_list: list[FrameMetadata] = []
+    previous_image = None
+    previous_keyframe_image = None
     segment_index = 0
+
+    logger.info("开始第一遍流式扫描: read_type=%s", read_type)
     while True:
         read_step_name = (
             "read_video_segment"
@@ -100,7 +115,7 @@ def run_data_preprocess_with_task_dir(
             else "read_image_segment"
         )
         logger.info(
-            "开始读取输入片段: segment_index=%d, read_type=%s",
+            "开始读取输入批次: segment_index=%d, read_type=%s",
             segment_index,
             read_type,
         )
@@ -108,125 +123,118 @@ def run_data_preprocess_with_task_dir(
             try:
                 original_frames = next(frame_segments)
             except StopIteration:
-                logger.info("输入片段读取结束: next_segment_index=%d", segment_index)
+                logger.info("输入批次读取结束: next_segment_index=%d", segment_index)
                 break
 
-        original_frame_ids = _frame_id_range(original_frames.frames)
         logger.info(
-            "输入片段读取完成: segment_index=%d, frame_count=%d, frame_id_range=%s",
+            "输入批次读取完成: segment_index=%d, frame_count=%d, frame_id_range=%s",
             segment_index,
             len(original_frames.frames),
-            original_frame_ids,
+            _frame_id_range(original_frames.frames),
         )
+        with _summary_step(summary_steps, f"stream_scan_segment_{segment_index}"):
+            for frame in original_frames.frames:
+                preprocessed_frame = preprocess_original_frame(frame)
+                image_path = _save_preprocessed_frame(
+                    preprocessed_frame,
+                    preprocessed_frame_dir,
+                )
+                metadata = build_frame_metadata(
+                    preprocessed_frame,
+                    image_path,
+                    previous_image=previous_image,
+                    previous_keyframe_image=previous_keyframe_image,
+                )
+                metadata_list.append(metadata)
+                previous_image = preprocessed_frame.image
+                if previous_keyframe_image is None or metadata.previous_keyframe_difference > 8.0:
+                    previous_keyframe_image = preprocessed_frame.image
+                del preprocessed_frame
+
         logger.info(
-            "开始预处理输入片段: segment_index=%d, frame_count=%d",
+            "流式扫描批次完成: segment_index=%d, batch_frames=%d, total_metadata=%d",
             segment_index,
             len(original_frames.frames),
+            len(metadata_list),
         )
-        with _summary_step(summary_steps, f"image_preprocess_segment_{segment_index}"):
-            preprocessed_frames = preprocess_original_frames(original_frames)
-        logger.info(
-            "输入片段预处理完成: segment_index=%d, frame_count=%d, frame_id_range=%s",
-            segment_index,
-            len(preprocessed_frames.frames),
-            _frame_id_range(preprocessed_frames.frames),
-        )
-
-        logger.info(
-            "开始关键帧选取: segment_index=%d, frame_count=%d",
-            segment_index,
-            len(preprocessed_frames.frames),
-        )
-        with _summary_step(summary_steps, f"key_frame_select_segment_{segment_index}"):
-            selected_frames = select_key_frames(preprocessed_frames)
-        logger.info(
-            "关键帧选取完成: segment_index=%d, input_frames=%d, selected_frames=%d, "
-            "frame_id_range=%s",
-            segment_index,
-            len(preprocessed_frames.frames),
-            len(selected_frames.frames),
-            _frame_id_range(selected_frames.frames),
-        )
-
-        logger.info(
-            "开始分块: segment_index=%d, selected_frames=%d",
-            segment_index,
-            len(selected_frames.frames),
-        )
-        with _summary_step(summary_steps, f"chunk_split_segment_{segment_index}"):
-            segment_chunks = split_original_frames_into_chunks(selected_frames)
-        logger.info(
-            "分块完成: segment_index=%d, segment_chunk_count=%d, frame_counts=%s",
-            segment_index,
-            len(segment_chunks),
-            [len(chunk.frames) for chunk in segment_chunks],
-        )
-
-        chunk_start_id = len(chunks)
-        chunks_to_save: list[Chunk] = []
-        for chunk in segment_chunks:
-            chunks_to_save.append(
-                Chunk(id=chunk_start_id + len(chunks_to_save), frames=chunk.frames)
-            )
-        logger.info(
-            "开始保存分块: segment_index=%d, chunk_ids=%s",
-            segment_index,
-            [chunk.id for chunk in chunks_to_save],
-        )
-        with _summary_step(summary_steps, f"chunk_save_segment_{segment_index}"):
-            task_dir = save_chunks(chunks_to_save, task_id, result_dir)
-        logger.info(
-            "保存分块完成: segment_index=%d, task_dir=%s, chunk_ids=%s",
-            segment_index,
-            task_dir,
-            [chunk.id for chunk in chunks_to_save],
-        )
-
-        if remove_mask_enable:
-            if remove_mask_model is None:
-                logger.info(
-                    "开始加载去除遮罩模型: segment_index=%d, model_path=%s, device=%s",
-                    segment_index,
-                    effective_remove_mask_model_path,
-                    remove_mask_device,
-                )
-                with _summary_step(summary_steps, "remove_mask_model_load"):
-                    remove_mask_model = load_remove_mask_model(
-                        effective_remove_mask_model_path,
-                        remove_mask_device,
-                    )
-                logger.info("去除遮罩模型加载完成: segment_index=%d", segment_index)
-            chunk_paths = [task_dir / f"{chunk.id}.pkl" for chunk in chunks_to_save]
-            logger.info(
-                "开始处理遮罩: segment_index=%d, chunk_paths=%s",
-                segment_index,
-                chunk_paths,
-            )
-            with _summary_step(summary_steps, f"remove_mask_segment_{segment_index}"):
-                masked_chunks = add_remove_masks_to_chunk_files(
-                    chunk_paths,
-                    model=remove_mask_model,
-                    device=remove_mask_device,
-                    remove_class_ids=effective_remove_mask_class_ids,
-                )
-            chunks_to_save = masked_chunks
-            logger.info(
-                "处理遮罩完成: segment_index=%d, chunk_ids=%s",
-                segment_index,
-                [chunk.id for chunk in chunks_to_save],
-            )
-        else:
-            logger.info("跳过去除遮罩: segment_index=%d", segment_index)
-
-        chunks.extend(chunks_to_save)
-        logger.info(
-            "输入片段处理完成: segment_index=%d, segment_chunk_count=%d, total_chunk_count=%d",
-            segment_index,
-            len(segment_chunks),
-            len(chunks),
-        )
+        del original_frames
         segment_index += 1
 
+    logger.info(
+        "第一遍流式扫描完成: total_frames=%d, preprocessed_dir=%s",
+        len(metadata_list),
+        preprocessed_frame_dir,
+    )
+
+    logger.info("开始第二遍候选筛选和第三遍全局选择: total_frames=%d", len(metadata_list))
+    with _summary_step(summary_steps, "key_frame_select_global"):
+        selected_metadata = select_key_frame_metadata(metadata_list)
+    logger.info(
+        "全局关键帧选择完成: total_frames=%d, selected_frames=%d, frame_id_range=%s",
+        len(metadata_list),
+        len(selected_metadata),
+        _metadata_frame_id_range(selected_metadata),
+    )
+
+    logger.info("开始分块前重新加载预处理图像: selected_frames=%d", len(selected_metadata))
+    with _summary_step(summary_steps, "reload_selected_preprocessed_frames"):
+        selected_frames = _load_selected_preprocessed_frames(selected_metadata)
+    logger.info(
+        "预处理图像重新加载完成: selected_frames=%d, frame_id_range=%s",
+        len(selected_frames.frames),
+        _frame_id_range(selected_frames.frames),
+    )
+
+    logger.info("开始分块: selected_frames=%d", len(selected_frames.frames))
+    with _summary_step(summary_steps, "chunk_split_global"):
+        segment_chunks = split_original_frames_into_chunks(selected_frames)
+    logger.info(
+        "分块完成: chunk_count=%d, frame_counts=%s",
+        len(segment_chunks),
+        [len(chunk.frames) for chunk in segment_chunks],
+    )
+
+    chunks_to_save: list[Chunk] = []
+    for chunk in segment_chunks:
+        chunks_to_save.append(
+            Chunk(id=len(chunks_to_save), frames=chunk.frames)
+        )
+    logger.info("开始保存分块: chunk_ids=%s", [chunk.id for chunk in chunks_to_save])
+    with _summary_step(summary_steps, "chunk_save_global"):
+        task_dir = save_chunks(chunks_to_save, task_id, result_dir)
+    logger.info(
+        "保存分块完成: task_dir=%s, chunk_ids=%s",
+        task_dir,
+        [chunk.id for chunk in chunks_to_save],
+    )
+
+    if remove_mask_enable:
+        logger.info(
+            "开始加载去除遮罩模型: model_path=%s, device=%s",
+            effective_remove_mask_model_path,
+            remove_mask_device,
+        )
+        with _summary_step(summary_steps, "remove_mask_model_load"):
+            remove_mask_model = load_remove_mask_model(
+                effective_remove_mask_model_path,
+                remove_mask_device,
+            )
+        logger.info("去除遮罩模型加载完成")
+        chunk_paths = [task_dir / f"{chunk.id}.pkl" for chunk in chunks_to_save]
+        logger.info("开始处理遮罩: chunk_paths=%s", chunk_paths)
+        with _summary_step(summary_steps, "remove_mask_global"):
+            masked_chunks = add_remove_masks_to_chunk_files(
+                chunk_paths,
+                model=remove_mask_model,
+                device=remove_mask_device,
+                remove_class_ids=effective_remove_mask_class_ids,
+            )
+        chunks_to_save = masked_chunks
+        logger.info("处理遮罩完成: chunk_ids=%s", [chunk.id for chunk in chunks_to_save])
+    else:
+        logger.info("跳过去除遮罩")
+
+    chunks.extend(chunks_to_save)
     logger.info(
         "全部输入片段分块完成: task_id=%s, task_dir=%s, chunk_count=%d",
         task_id,
@@ -273,6 +281,41 @@ def _frame_id_range(frames) -> str:
         return "empty"
 
     return f"{frames[0].id}-{frames[-1].id}"
+
+
+def _metadata_frame_id_range(metadata_list: list[FrameMetadata]) -> str:
+    if not metadata_list:
+        return "empty"
+
+    return f"{metadata_list[0].frame_id}-{metadata_list[-1].frame_id}"
+
+
+def _save_preprocessed_frame(frame: BaseFrame, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_path = output_dir / f"{frame.id:08d}.png"
+    image = cv2.cvtColor(frame.image, cv2.COLOR_RGB2BGR)
+    if not cv2.imwrite(str(image_path), image):
+        raise ValueError(f"Could not write preprocessed frame: {image_path}")
+    return image_path
+
+
+def _load_selected_preprocessed_frames(
+    selected_metadata: list[FrameMetadata],
+) -> OriginalFrames:
+    frames = OriginalFrames()
+    for metadata in selected_metadata:
+        image = cv2.imread(str(metadata.image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"Could not read preprocessed frame: {metadata.image_path}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        frames.add_frame(
+            BaseFrame(
+                id=metadata.frame_id,
+                image=image,
+                gps_location=metadata.gps_location,
+            )
+        )
+    return frames
 
 
 def save_chunks(

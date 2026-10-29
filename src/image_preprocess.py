@@ -11,38 +11,45 @@ logger = logging.getLogger(__name__)
 def preprocess_original_frames(frames: OriginalFrames) -> OriginalFrames:
     preprocessed_frames = OriginalFrames()
     for frame in frames.frames:
-        image = _ensure_rgb_image(frame.image)
-        image = _equalize_illumination(image)
-        image = _resize_for_vggt(image)
-        image = _pad_to_shape(image, 518, 518)
-        mask = _prepare_mask(frame.mask)
-        preprocessed_frames.add_frame(
-            BaseFrame(
-                id=frame.id,
-                image=image,
-                gps_location=frame.gps_location,
-                mask=mask,
-            )
-        )
+        preprocessed_frames.add_frame(preprocess_original_frame(frame))
 
     logger.info("所有视频帧处理完成: count=%d", len(preprocessed_frames.frames))
     return preprocessed_frames
 
 
+def preprocess_original_frame(frame: BaseFrame) -> BaseFrame:
+    image = _ensure_rgb_image(frame.image)
+    image = _equalize_illumination(image)
+    image = _resize_for_vggt(image)
+    mask = _prepare_mask(frame.mask)
+    return BaseFrame(
+        id=frame.id,
+        image=image,
+        gps_location=frame.gps_location,
+        mask=mask,
+    )
+
+
 def _prepare_mask(mask):
-    mask = _ensure_mask_channels(mask)
-    mask = _resize_for_vggt(mask)
-    return _pad_to_shape(mask, 518, 518, value=(0, 0, 0))
+    mask = _ensure_label_mask(mask)
+    return _resize_for_vggt(mask, interpolation=cv2.INTER_NEAREST)
 
 
-def _ensure_mask_channels(mask):
+def _ensure_label_mask(mask):
     if mask.ndim == 2:
-        return cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)
+        return mask
 
     if mask.shape[2] == 4:
-        return mask[:, :, :3]
+        mask = mask[:, :, :3]
 
-    return mask
+    if mask.shape[2] == 1:
+        return mask[:, :, 0]
+    if mask.shape[2] == 3:
+        if (mask[:, :, 0] == mask[:, :, 1]).all() and (mask[:, :, 0] == mask[:, :, 2]).all():
+            return mask[:, :, 0]
+        return ((mask == 2).any(axis=2).astype(mask.dtype)) * 2
+
+    raise ValueError(f"frame mask must have 1, 3, or 4 channels, got {mask.shape[2]}")
 
 
 def _ensure_rgb_image(image):
@@ -67,49 +74,26 @@ def _equalize_illumination(image):
     return cv2.cvtColor(lab_image, cv2.COLOR_LAB2RGB)
 
 
-def _resize_for_vggt(image, target_size: int = 518):
+def _resize_for_vggt(image, target_size: int = 518, interpolation: int | None = None):
     height, width = image.shape[:2]
-    new_width = target_size
-    new_height = round(height * (new_width / width) / 14) * 14
-    new_height = max(new_height, 14)
+    if height <= 0 or width <= 0:
+        raise ValueError(f"frame image has invalid shape {image.shape}")
+
+    scale = target_size / min(height, width)
+    new_width = max(target_size, round(width * scale))
+    new_height = max(target_size, round(height * scale))
+    resize_interpolation = interpolation
+    if resize_interpolation is None:
+        resize_interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
 
     image = cv2.resize(
         image,
         (new_width, new_height),
-        interpolation=cv2.INTER_CUBIC,
+        interpolation=resize_interpolation,
     )
 
-    if new_height > target_size:
-        start_y = (new_height - target_size) // 2
-        image = image[start_y : start_y + target_size, :, :]
-
-    return image
-
-
-def _pad_to_shape(
-    image,
-    target_height: int,
-    target_width: int,
-    value=(255, 255, 255),
-):
-    height, width = image.shape[:2]
-    height_padding = target_height - height
-    width_padding = target_width - width
-
-    if height_padding <= 0 and width_padding <= 0:
-        return image
-
-    pad_top = height_padding // 2
-    pad_bottom = height_padding - pad_top
-    pad_left = width_padding // 2
-    pad_right = width_padding - pad_left
-
-    return cv2.copyMakeBorder(
-        image,
-        pad_top,
-        pad_bottom,
-        pad_left,
-        pad_right,
-        cv2.BORDER_CONSTANT,
-        value=value,
-    )
+    start_y = (new_height - target_size) // 2
+    start_x = (new_width - target_size) // 2
+    if image.ndim == 2:
+        return image[start_y : start_y + target_size, start_x : start_x + target_size]
+    return image[start_y : start_y + target_size, start_x : start_x + target_size, :]

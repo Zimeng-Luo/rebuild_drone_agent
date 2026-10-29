@@ -61,12 +61,6 @@ def iter_original_frame_segments_from_image(
                 path.name,
                 segment_size,
             )
-        logger.info(
-            "读取图片: segment_index=%d, frame_id=%d, image=%s",
-            segment_index,
-            frame_id,
-            path.name,
-        )
         segment_frames.add_frame(
             BaseFrame(
                 id=frame_id,

@@ -6,7 +6,13 @@ from pathlib import Path
 import torch
 
 from src.logging_utils import configure_logging, configure_task_file_logging
-from src.rebuild import load_chunk, load_vggt_model, rebuild_chunk_to_npz, rebuild_npz_to_glb
+from src.rebuild import (
+    load_chunk,
+    load_vggt_model,
+    rebuild_chunk_to_npz,
+    rebuild_npz_to_glb,
+    rebuild_npz_to_glb_streaming,
+)
 from src.task_summary import ResourceStepMonitor, StepSummary
 
 
@@ -58,13 +64,15 @@ def run_rebuild_to_glb(
     mask_white_bg: bool = False,
     show_cam: bool = True,
     mask_sky: bool = False,
-    prediction_mode: str = "Predicted Pointmap",
+    prediction_mode: str = "Depthmap and Camera Branch",
+    streaming: bool = True,
 ) -> Path:
     """Convert one reconstruction npz file to GLB beside the npz by default."""
     configure_logging()
     npz_path = Path(npz_path)
     configure_task_file_logging(npz_path.parent)
-    return rebuild_npz_to_glb(
+    converter = rebuild_npz_to_glb_streaming if streaming else rebuild_npz_to_glb
+    return converter(
         npz_path=npz_path,
         output_path=output_path,
         conf_thres=conf_thres,

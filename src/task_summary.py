@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import shutil
 import threading
 import time
 from typing import Any
@@ -149,7 +150,7 @@ def collect_output_sizes(task_dir: str | Path) -> dict[str, Any]:
 
 
 def delete_numbered_intermediate_files(task_dir: str | Path) -> list[str]:
-    """Delete numbered chunk intermediates such as 0.pkl and 0.npz."""
+    """Delete numbered chunk intermediates and preprocessed frame images."""
     task_dir = Path(task_dir)
     if not task_dir.exists():
         return []
@@ -165,6 +166,14 @@ def delete_numbered_intermediate_files(task_dir: str | Path) -> list[str]:
 
         path.unlink()
         deleted_paths.append(str(path.relative_to(task_dir)))
+
+    preprocessed_frame_dir = task_dir / "preprocessed_frames"
+    if preprocessed_frame_dir.is_dir():
+        for path in sorted(preprocessed_frame_dir.rglob("*")):
+            if path.is_file():
+                deleted_paths.append(str(path.relative_to(task_dir)))
+        shutil.rmtree(preprocessed_frame_dir)
+        deleted_paths.append(str(preprocessed_frame_dir.relative_to(task_dir)))
 
     return deleted_paths
 

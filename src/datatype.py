@@ -17,18 +17,18 @@ class BaseFrame:
 
     def __post_init__(self) -> None:
         if self.mask is None:
-            self.mask = np.zeros_like(self.image)
+            self.mask = np.zeros(_image_hw(self.image), dtype=np.uint8)
             return
 
-        if self.mask.shape != self.image.shape:
+        expected_shapes = (self.image.shape, _image_hw(self.image))
+        if self.mask.shape not in expected_shapes:
             raise ValueError(
                 f"frame mask shape {self.mask.shape} does not match image shape "
-                f"{self.image.shape}"
+                f"{self.image.shape} or image height/width {_image_hw(self.image)}"
             )
-        if self.mask.dtype != self.image.dtype:
+        if self.mask.dtype != np.uint8:
             raise ValueError(
-                f"frame mask dtype {self.mask.dtype} does not match image dtype "
-                f"{self.image.dtype}"
+                f"frame mask dtype {self.mask.dtype} must be uint8 for class labels"
             )
 
 
@@ -82,3 +82,9 @@ class Chunk:
     def __post_init__(self) -> None:
         if not self.frame_ids:
             self.frame_ids = [frame.id for frame in self.frames]
+
+
+def _image_hw(image: NDArray[np.uint8]) -> tuple[int, int]:
+    if image.ndim == 3 and image.shape[0] in (3, 4) and image.shape[-1] not in (3, 4):
+        return image.shape[1], image.shape[2]
+    return image.shape[:2]
