@@ -1,9 +1,40 @@
-data/
-result/
-reference/
-config/
+# Local inputs, weights and generated results
+/data/
+/result/
+/reference/
+/models/*
+!/models/*.py
+/experiment/result/
+/experiment/output/
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Frontend dependencies and generated static bundle
+node_modules/
+/app/static/
+/frontend/dist/
+
+# Local editor/agent settings and secrets
+.vscode/
+.idea/
+.agents/
+.codex/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+*.tmp
+
+# Large research downloads
 Mill_19/building-pixsfm.tgz
 building-pixsfm/
-models/
 test.zip
-experiment/

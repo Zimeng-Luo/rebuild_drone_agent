@@ -68,7 +68,7 @@ def detect_loop_constraints(
             source_index, target_index = target_index, source_index
         if source_index >= len(chunk_to_processes) or target_index < 0:
             continue
-        if source_index - target_index < ALIGN_LOOP_MIN_CHUNK_GAP:
+        if source_index - target_index < max(2, ALIGN_LOOP_MIN_CHUNK_GAP):
             continue
 
         try:
@@ -111,6 +111,8 @@ def estimate_loop_pair_sim3(
 
     for source_index, source_frame in _loop_probe_frame_items(source_chunk):
         for target_index, target_frame in _loop_probe_frame_items(target_chunk):
+            if source_frame.id == target_frame.id:
+                continue
             score, matches, _, _ = _match_frame_features(source_frame.image, target_frame.image)
             if len(matches) < ALIGN_LOOP_MIN_MATCHES or score < ALIGN_LOOP_MIN_SCORE:
                 continue
@@ -667,6 +669,7 @@ def save_aligned_npz_files_streaming(
     loop_model: Any | None = None,
     loop_model_name_or_path: str = ALIGN_LOOP_MODEL_NAME_OR_PATH,
     device: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> Path:
     """Align chunk npz files and stream the merged arrays through npy memmaps."""
     paths = [Path(npz_path) for npz_path in npz_paths]
@@ -680,6 +683,7 @@ def save_aligned_npz_files_streaming(
         loop_model=loop_model,
         loop_model_name_or_path=loop_model_name_or_path,
         device=device,
+        diagnostics=diagnostics,
     )
     return write_aligned_npz_files_streaming(paths, transforms, output_path)
 
@@ -691,9 +695,24 @@ def estimate_npz_file_transforms(
     loop_model: Any | None = None,
     loop_model_name_or_path: str = ALIGN_LOOP_MODEL_NAME_OR_PATH,
     device: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[Sim3]:
     """Estimate absolute chunk transforms while loading only needed chunks."""
     paths = [Path(npz_path) for npz_path in npz_paths]
+    diagnostics = diagnostics if diagnostics is not None else {}
+    diagnostics.update({
+        "enable_loop_requested": bool(enable_loop),
+        "chunk_count": len(paths),
+        "sequential_edge_count": max(0, len(paths) - 1),
+        "loop_candidate_count": None,
+        "loop_accepted_count": 0,
+        "optimizer_attempted": False,
+        "optimizer_success": None,
+        "optimizer_applied": False,
+        "fallback_reason": None,
+        "mode": "single_chunk" if len(paths) == 1 else "sequential_chunks",
+        "independent_loop_verified": False,
+    })
     if not paths:
         return []
     if len(paths) == 1:
@@ -720,15 +739,33 @@ def estimate_npz_file_transforms(
             model=loop_model,
             model_name_or_path=loop_model_name_or_path,
             device=device,
+            diagnostics=diagnostics,
         )
+        if diagnostics is not None:
+            diagnostics["loop_accepted_count"] = len(loop_constraints)
         if loop_constraints:
-            adjacent_transforms = optimize_sim3_pose_graph(
+            if diagnostics is not None:
+                diagnostics["optimizer_attempted"] = True
+            optimized = optimize_sim3_pose_graph(
                 adjacent_transforms,
                 loop_constraints,
+                diagnostics=diagnostics,
             )
-            logger.info("回环全局优化完成: loop_constraint_count=%d", len(loop_constraints))
+            adjacent_transforms = optimized
+            if diagnostics.get("optimizer_applied"):
+                diagnostics["mode"] = "loop_optimized"
+                logger.info("已采用回环优化: loop_constraint_count=%d", len(loop_constraints))
+            else:
+                logger.info("回退顺序对齐: reason=%s", diagnostics.get("fallback_reason"))
         else:
+            if not diagnostics.get("fallback_reason"):
+                diagnostics["fallback_reason"] = (
+                    "no_loop_candidates" if diagnostics.get("loop_candidate_count") == 0
+                    else "no_reliable_loop_constraints"
+                )
             logger.info("未找到可靠回环约束，使用顺序拼接结果")
+    elif diagnostics is not None:
+        diagnostics["fallback_reason"] = "loop_disabled_by_request"
 
     return [_identity_sim3(), *accumulate_sim3_transforms(adjacent_transforms)]
 
@@ -739,15 +776,21 @@ def estimate_loop_constraints_from_npz_files(
     model: Any | None = None,
     model_name_or_path: str = ALIGN_LOOP_MODEL_NAME_OR_PATH,
     device: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[LoopConstraint]:
     """Estimate loop constraints by loading only the two chunks needed per pair."""
     paths = [Path(npz_path) for npz_path in npz_paths]
     if len(paths) < 3:
+        if diagnostics is not None:
+            diagnostics["loop_candidate_count"] = 0
+            diagnostics["fallback_reason"] = "fewer_than_three_chunks"
         return []
 
     if candidate_pairs is None:
         probe_chunks = [_load_npz_probe_chunk(path) for path in paths]
         candidate_pairs = _find_loop_candidate_pairs(probe_chunks)
+    if diagnostics is not None:
+        diagnostics["loop_candidate_count"] = len(candidate_pairs)
     if not candidate_pairs:
         return []
 
@@ -755,6 +798,7 @@ def estimate_loop_constraints_from_npz_files(
         model = load_vggt_model(model_name_or_path=model_name_or_path, device=device)
 
     constraints: list[LoopConstraint] = []
+    min_gap = max(2, ALIGN_LOOP_MIN_CHUNK_GAP)
     for source_index, target_index in candidate_pairs:
         if source_index == target_index:
             continue
@@ -762,7 +806,7 @@ def estimate_loop_constraints_from_npz_files(
             source_index, target_index = target_index, source_index
         if source_index >= len(paths) or target_index < 0:
             continue
-        if source_index - target_index < ALIGN_LOOP_MIN_CHUNK_GAP:
+        if source_index - target_index < min_gap:
             continue
 
         source_chunk = npz_load(paths[source_index])
@@ -922,9 +966,13 @@ def align_chunks(
 def optimize_sim3_pose_graph(
     adjacent_transforms: list[Sim3],
     loop_constraints: list[LoopConstraint],
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[Sim3]:
     """Optimize chunk poses using adjacent and loop Sim3 constraints."""
     if not adjacent_transforms or not loop_constraints:
+        if diagnostics is not None:
+            diagnostics.update({"optimizer_success": False, "optimizer_applied": False,
+                                "fallback_reason": "no_constraints_or_edges"})
         return adjacent_transforms
 
     initial_absolute = [_identity_sim3()]
@@ -949,21 +997,58 @@ def optimize_sim3_pose_graph(
             values.extend(_sim3_error_vector(error))
         return np.array(values, dtype=np.float64)
 
-    result = least_squares(
-        residual,
-        initial_params,
-        max_nfev=ALIGN_LOOP_OPT_MAX_ITERS,
-        loss="soft_l1",
-        f_scale=1.0,
-    )
-    optimized_absolute = [_identity_sim3()]
-    optimized_absolute.extend(_params_to_absolute_transforms(result.x))
-    optimized_adjacent = []
-    for index in range(len(adjacent_transforms)):
-        optimized_adjacent.append(
-            relative_sim3(optimized_absolute[index + 1], optimized_absolute[index])
+    try:
+        result = least_squares(
+            residual,
+            initial_params,
+            max_nfev=ALIGN_LOOP_OPT_MAX_ITERS,
+            loss="soft_l1",
+            f_scale=1.0,
         )
+    except Exception as exc:
+        if diagnostics is not None:
+            diagnostics.update({"optimizer_success": False, "optimizer_applied": False,
+                                "fallback_reason": "optimizer_exception"})
+        logger.warning("Sim3图优化异常，保留顺序拼接结果: %s", exc)
+        return adjacent_transforms
+    if not result.success:
+        if diagnostics is not None:
+            diagnostics.update({"optimizer_success": False, "optimizer_applied": False,
+                                "fallback_reason": "optimizer_unsuccessful"})
+        logger.warning("Sim3图优化未收敛，保留顺序拼接结果: status=%s", result.status)
+        return adjacent_transforms
+    if not np.all(np.isfinite(result.x)):
+        if diagnostics is not None:
+            diagnostics.update({"optimizer_success": False, "optimizer_applied": False,
+                                "fallback_reason": "non_finite_optimizer_parameters"})
+        logger.warning("Sim3图优化参数包含非有限值，保留顺序拼接结果")
+        return adjacent_transforms
 
+    try:
+        optimized_absolute = [_identity_sim3()]
+        optimized_absolute.extend(_params_to_absolute_transforms(result.x))
+        if not all(_sim3_is_finite(transform) for transform in optimized_absolute):
+            raise ValueError("decoded absolute transform is non-finite")
+        optimized_adjacent = [
+            relative_sim3(optimized_absolute[index + 1], optimized_absolute[index])
+            for index in range(len(adjacent_transforms))
+        ]
+    except (ValueError, IndexError, FloatingPointError) as exc:
+        if diagnostics is not None:
+            diagnostics.update({"optimizer_success": False, "optimizer_applied": False,
+                                "fallback_reason": "invalid_decoded_transform"})
+        logger.warning("Sim3图优化变换解码无效，保留顺序拼接结果: %s", exc)
+        return adjacent_transforms
+    if not all(_sim3_is_finite(transform) for transform in optimized_adjacent):
+        if diagnostics is not None:
+            diagnostics.update({"optimizer_success": False, "optimizer_applied": False,
+                                "fallback_reason": "non_finite_optimized_transform"})
+        logger.warning("Sim3图优化变换包含非有限值，保留顺序拼接结果")
+        return adjacent_transforms
+
+    if diagnostics is not None:
+        diagnostics.update({"optimizer_success": True, "optimizer_applied": True,
+                            "fallback_reason": None})
     logger.info(
         "Sim3图优化状态: success=%s, initial_cost=%.6g, final_cost=%.6g, iterations=%s",
         result.success,
@@ -972,6 +1057,15 @@ def optimize_sim3_pose_graph(
         result.nfev,
     )
     return optimized_adjacent
+
+
+def _sim3_is_finite(transform: Sim3) -> bool:
+    scale, rotation, translation = transform
+    return bool(
+        np.isfinite(scale)
+        and np.all(np.isfinite(rotation))
+        and np.all(np.isfinite(translation))
+    )
 
 
 def _frame_id_to_index(chunk: ChunkToProcess) -> dict[int, int]:
@@ -1006,9 +1100,10 @@ def _normalize_conf_shape(
 
 def _find_loop_candidate_pairs(chunks: list[ChunkToProcess]) -> list[LoopPair]:
     scored_pairs: list[tuple[float, int, int]] = []
+    min_gap = max(2, ALIGN_LOOP_MIN_CHUNK_GAP)
     for source_index, source_chunk in enumerate(chunks):
         per_source: list[tuple[float, int, int]] = []
-        for target_index in range(0, source_index - ALIGN_LOOP_MIN_CHUNK_GAP + 1):
+        for target_index in range(0, source_index - min_gap + 1):
             target_chunk = chunks[target_index]
             score = _chunk_visual_score(source_chunk, target_chunk)
             if score >= ALIGN_LOOP_MIN_SCORE:
@@ -1063,6 +1158,8 @@ def _chunk_visual_score(chunk_a: ChunkToProcess, chunk_b: ChunkToProcess) -> flo
     best = 0.0
     for frame_a in _loop_probe_frames(chunk_a):
         for frame_b in _loop_probe_frames(chunk_b):
+            if frame_a.id == frame_b.id:
+                continue
             score, _, _, _ = _match_frame_features(frame_a.image, frame_b.image)
             best = max(best, score)
     return best

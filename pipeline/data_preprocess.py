@@ -9,6 +9,11 @@ from contextlib import contextmanager
 import cv2
 
 from config import (
+    CHUNK_OVERLAP_SIZE,
+    CHUNK_SIZE,
+    KEY_FRAME_DELETE_RATIO,
+    VIDEO_EXTRACT_FPS,
+    VIDEO_SEGMENT_SECONDS,
     IMAGE_SAMPLE_INTERVAL,
     IMAGE_SEGMENT_SIZE,
     READ_TYPE,
@@ -30,6 +35,7 @@ from src.key_frame_select import (
 )
 from src.logging_utils import configure_logging, configure_task_file_logging
 from src.remove_mask import add_remove_masks_to_chunk_files, load_remove_mask_model
+from src.run_evidence import build_preprocess_evidence, write_preprocess_evidence
 from src.task_summary import ResourceStepMonitor, StepSummary
 from src.video_load import iter_original_frame_segments_from_video
 
@@ -176,6 +182,31 @@ def run_data_preprocess_with_task_dir(
         _metadata_frame_id_range(selected_metadata),
     )
 
+    evidence = build_preprocess_evidence(
+        input_path=input_path,
+        config={
+            "read_type": read_type,
+            "image_segment_size": image_segment_size,
+            "image_sample_interval": image_sample_interval,
+            "video_extract_fps": VIDEO_EXTRACT_FPS,
+            "video_segment_seconds": VIDEO_SEGMENT_SECONDS,
+            "key_frame_delete_ratio": KEY_FRAME_DELETE_RATIO,
+            "chunk_size": CHUNK_SIZE,
+            "chunk_overlap_size": CHUNK_OVERLAP_SIZE,
+            "remove_mask_enable": remove_mask_enable,
+        },
+        scanned_frame_count=len(metadata_list),
+        selected_frame_ids=(metadata.frame_id for metadata in selected_metadata),
+    )
+    evidence_path = write_preprocess_evidence(task_dir, evidence)
+    if evidence["status"] == "blocked":
+        raise ValueError(
+            "multi-view reconstruction requires at least 2 distinct selected frames; "
+            f"got {evidence['unique_selected_frame_count']} from "
+            f"{len(metadata_list)} sampled/scanned frames. "
+            f"Diagnostics: {evidence_path}"
+        )
+
     logger.info("开始分块前重新加载预处理图像: selected_frames=%d", len(selected_metadata))
     with _summary_step(summary_steps, "reload_selected_preprocessed_frames"):
         selected_frames = _load_selected_preprocessed_frames(selected_metadata)
@@ -207,6 +238,15 @@ def run_data_preprocess_with_task_dir(
         task_dir,
         [chunk.id for chunk in chunks_to_save],
     )
+
+    evidence = build_preprocess_evidence(
+        input_path=input_path,
+        config=evidence["config"],
+        scanned_frame_count=len(metadata_list),
+        selected_frame_ids=(metadata.frame_id for metadata in selected_metadata),
+        chunks=chunks_to_save,
+    )
+    write_preprocess_evidence(task_dir, evidence)
 
     if remove_mask_enable:
         logger.info(
@@ -346,4 +386,4 @@ def save_chunks(
 
 
 def _create_task_id() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")

@@ -187,7 +187,6 @@ def _remove_near_similar_overlapped_frames(
     candidates: list[FrameMetadata],
     min_frame_gap: int = 2,
     similarity_threshold: float = 0.88,
-    overlap_threshold: float = 0.78,
 ) -> list[FrameMetadata]:
     selected: list[FrameMetadata] = []
     for metadata in candidates:
@@ -196,7 +195,6 @@ def _remove_near_similar_overlapped_frames(
             metadata,
             min_frame_gap,
             similarity_threshold,
-            overlap_threshold,
         )
         if duplicate_index is None:
             selected.append(metadata)
@@ -258,22 +256,13 @@ def _find_duplicate_index(
     metadata: FrameMetadata,
     min_frame_gap: int,
     similarity_threshold: float,
-    overlap_threshold: float,
 ) -> int | None:
     for index, selected_metadata in enumerate(selected):
         frame_gap = abs(metadata.frame_id - selected_metadata.frame_id)
         similarity = _descriptor_similarity(metadata.descriptor, selected_metadata.descriptor)
-        overlap = max(
-            metadata.previous_overlap_score,
-            metadata.previous_keyframe_overlap_score,
-            selected_metadata.previous_overlap_score,
-            selected_metadata.previous_keyframe_overlap_score,
-        )
-        if (
-            frame_gap <= min_frame_gap
-            or similarity >= similarity_threshold
-            or overlap >= overlap_threshold
-        ):
+        # Cached overlap scores describe each frame's *previous* neighbours,
+        # not this candidate pair. They cannot establish a duplicate here.
+        if frame_gap <= min_frame_gap or similarity >= similarity_threshold:
             return index
     return None
 

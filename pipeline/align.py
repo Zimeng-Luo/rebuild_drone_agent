@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 import logging
 from pathlib import Path
 
@@ -25,7 +26,6 @@ from utils.pointcloud_downsample import downsample_point_cloud_file
 
 
 logger = logging.getLogger(__name__)
-ALIGN_GLB_MIN_CONF_PERCENTILE = 50.0
 
 
 def run_align_and_merge(
@@ -78,6 +78,7 @@ def run_align_and_merge(
     merged_ply_path = storage_dir / output_ply_name
 
     logger.info("开始计算并保存拼接结果: output_path=%s", merged_npz_path)
+    alignment_diagnostics = {}
     with _summary_step(summary_steps, "align_compute_and_save"):
         save_aligned_npz_files_streaming(
             chunk_paths,
@@ -87,7 +88,16 @@ def run_align_and_merge(
             loop_model=loop_model,
             loop_model_name_or_path=loop_model_name_or_path,
             device=str(device) if device is not None else None,
+            diagnostics=alignment_diagnostics,
         )
+    evidence_path = storage_dir / "alignment_evidence.json"
+    evidence_tmp_path = evidence_path.with_name(f".{evidence_path.name}.tmp")
+    evidence_tmp_path.write_text(
+        json.dumps(alignment_diagnostics, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    evidence_tmp_path.replace(evidence_path)
+    logger.info("对齐证据已保存: %s", evidence_path)
     logger.info("拼接结果保存完成: output_path=%s", merged_npz_path)
     if export_glb_enable:
         logger.info("开始导出最终 GLB: npz_path=%s, output_path=%s", merged_npz_path, merged_glb_path)
@@ -95,7 +105,7 @@ def run_align_and_merge(
             rebuild_npz_to_glb_streaming(
                 npz_path=merged_npz_path,
                 output_path=merged_glb_path,
-                conf_thres=max(conf_thres, ALIGN_GLB_MIN_CONF_PERCENTILE),
+                conf_thres=conf_thres,
                 filter_by_frames=filter_by_frames,
                 mask_black_bg=mask_black_bg,
                 mask_white_bg=mask_white_bg,

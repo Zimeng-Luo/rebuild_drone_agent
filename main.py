@@ -50,6 +50,11 @@ from pipeline import (
     run_rebuild_chunks,
 )
 from src.logging_utils import configure_logging
+from src.run_evidence import (
+    build_completed_run_evidence,
+    record_pipeline_failure,
+    validate_multiview_chunks,
+)
 from src.task_summary import (
     ResourceStepMonitor,
     collect_output_sizes,
@@ -99,17 +104,16 @@ def run_pipeline(
         task_created_at = step_monitor.started_at
         step_summaries.append(step_monitor.summary())
 
-        if not chunks:
-            raise ValueError(f"no chunks generated from input: {input_path}")
+        validate_multiview_chunks(task_dir, chunks)
 
-        with ResourceStepMonitor("rebuild_chunks") as step_monitor:
+        with record_pipeline_failure(task_dir, "rebuild_chunks"), ResourceStepMonitor("rebuild_chunks") as step_monitor:
             run_rebuild_chunks(
                 [task_dir / f"{chunk.id}.pkl" for chunk in chunks],
                 summary_steps=step_summaries,
             )
         step_summaries.append(step_monitor.summary())
 
-        with ResourceStepMonitor("align_and_merge") as step_monitor:
+        with record_pipeline_failure(task_dir, "align_and_merge"), ResourceStepMonitor("align_and_merge") as step_monitor:
             glb_path = run_align_and_merge(
                 storage_dir=task_dir,
                 chunk_count=len(chunks),
@@ -121,6 +125,7 @@ def run_pipeline(
                 pointcloud_downsample_voxel_size=pointcloud_downsample_voxel_size,
                 pointcloud_downsample_min_keep_ratio=pointcloud_downsample_min_keep_ratio,
                 summary_steps=step_summaries,
+                enable_loop=ALIGN_LOOP_ENABLE,
             )
         step_summaries.append(step_monitor.summary())
 
@@ -128,24 +133,29 @@ def run_pipeline(
     write_task_summary_log(
         task_dir,
         created_at=task_created_at,
-        parameters=_build_summary_parameters(
-            input_path=input_path,
-            result_dir=result_dir,
-            read_type=read_type,
-            image_segment_size=image_segment_size,
-            image_sample_interval=image_sample_interval,
-            chunk_count=len(chunks),
-            remove_mask_enable=remove_mask_enable,
-            remove_mask_model_path=remove_mask_model_path,
-            remove_mask_device=remove_mask_device,
-            remove_mask_class_ids=remove_mask_class_ids,
-            export_glb_enable=export_glb_enable,
-            export_ply_enable=export_ply_enable,
-            align_glb_conf_thres=align_glb_conf_thres,
-            align_ply_conf_thres=align_ply_conf_thres,
-            pointcloud_downsample_enable=pointcloud_downsample_enable,
-            pointcloud_downsample_voxel_size=pointcloud_downsample_voxel_size,
-            pointcloud_downsample_min_keep_ratio=pointcloud_downsample_min_keep_ratio,
+        parameters=dict(
+            _build_summary_parameters(
+                input_path=input_path,
+                result_dir=result_dir,
+                read_type=read_type,
+                image_segment_size=image_segment_size,
+                image_sample_interval=image_sample_interval,
+                chunk_count=len(chunks),
+                remove_mask_enable=remove_mask_enable,
+                remove_mask_model_path=remove_mask_model_path,
+                remove_mask_device=remove_mask_device,
+                remove_mask_class_ids=remove_mask_class_ids,
+                export_glb_enable=export_glb_enable,
+                export_ply_enable=export_ply_enable,
+                align_glb_conf_thres=align_glb_conf_thres,
+                align_ply_conf_thres=align_ply_conf_thres,
+                pointcloud_downsample_enable=pointcloud_downsample_enable,
+                pointcloud_downsample_voxel_size=pointcloud_downsample_voxel_size,
+                pointcloud_downsample_min_keep_ratio=pointcloud_downsample_min_keep_ratio,
+            ),
+            run_evidence=build_completed_run_evidence(
+                task_dir, chunk_count=len(chunks), loop_requested=ALIGN_LOOP_ENABLE
+            ),
         ),
         steps=step_summaries,
         total=total_monitor.summary(),
@@ -232,7 +242,7 @@ def _build_summary_parameters(
     }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run input-to-GLB reconstruction pipeline.",
     )
@@ -260,11 +270,10 @@ def parse_args() -> argparse.Namespace:
         default=IMAGE_SAMPLE_INTERVAL,
         help=f"Read one image every N sorted images. Default: {IMAGE_SAMPLE_INTERVAL}",
     )
-    parser.add_argument(
-        "--no-remove-mask",
-        action="store_true",
-        help="Disable SegFormer semantic mask generation after chunk saving.",
-    )
+    mask_group = parser.add_mutually_exclusive_group()
+    mask_group.add_argument("--remove-mask", dest="remove_mask_enable", action="store_true", help="Enable SegFormer sky masking.")
+    mask_group.add_argument("--no-remove-mask", dest="remove_mask_enable", action="store_false", help="Disable SegFormer sky masking.")
+    parser.set_defaults(remove_mask_enable=REMOVE_MASK_ENABLE)
     parser.add_argument(
         "--remove-mask-model-path",
         default=REMOVE_MASK_MODEL_PATH,
@@ -312,11 +321,10 @@ def parse_args() -> argparse.Namespace:
         default=not EXPORT_PLY_ENABLE,
         help=f"Disable final PLY export. Default enabled: {EXPORT_PLY_ENABLE}",
     )
-    parser.add_argument(
-        "--no-pointcloud-downsample",
-        action="store_true",
-        help="Disable final downsampled GLB/PLY export.",
-    )
+    downsample_group = parser.add_mutually_exclusive_group()
+    downsample_group.add_argument("--pointcloud-downsample", dest="pointcloud_downsample_enable", action="store_true", help="Export additional downsampled GLB/PLY files.")
+    downsample_group.add_argument("--no-pointcloud-downsample", dest="pointcloud_downsample_enable", action="store_false", help="Disable additional downsampled exports.")
+    parser.set_defaults(pointcloud_downsample_enable=POINTCLOUD_DOWNSAMPLE_ENABLE)
     parser.add_argument(
         "--pointcloud-downsample-voxel-size",
         type=float,
@@ -332,7 +340,7 @@ def parse_args() -> argparse.Namespace:
             f"Default: {POINTCLOUD_DOWNSAMPLE_MIN_KEEP_RATIO}"
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -344,7 +352,7 @@ def main() -> None:
         read_type=args.read_type,
         image_segment_size=args.image_segment_size,
         image_sample_interval=args.image_sample_interval,
-        remove_mask_enable=not args.no_remove_mask,
+        remove_mask_enable=args.remove_mask_enable,
         remove_mask_model_path=args.remove_mask_model_path,
         remove_mask_device=args.remove_mask_device,
         remove_mask_class_ids=tuple(args.remove_mask_class_ids),
@@ -352,7 +360,7 @@ def main() -> None:
         export_ply_enable=not args.no_export_ply,
         align_glb_conf_thres=args.align_glb_conf_thres,
         align_ply_conf_thres=args.align_ply_conf_thres,
-        pointcloud_downsample_enable=not args.no_pointcloud_downsample,
+        pointcloud_downsample_enable=args.pointcloud_downsample_enable,
         pointcloud_downsample_voxel_size=args.pointcloud_downsample_voxel_size,
         pointcloud_downsample_min_keep_ratio=args.pointcloud_downsample_min_keep_ratio,
     )
