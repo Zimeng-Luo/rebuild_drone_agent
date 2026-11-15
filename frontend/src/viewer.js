@@ -30,10 +30,6 @@ export class SceneViewer {
     const light = new THREE.DirectionalLight(0xffffff, 2.5);
     light.position.set(3, 8, 5);
     this.scene.add(light);
-    this.grid = new THREE.GridHelper(40, 40, '#54736c', '#2a3a3d');
-    this.grid.material.transparent = true;
-    this.grid.material.opacity = 0.65;
-    this.scene.add(this.grid);
     this.reset();
     this.observer = new ResizeObserver(() => this.resize());
     this.observer.observe(container);
@@ -71,8 +67,6 @@ export class SceneViewer {
       this.disposeObject(this.object);
     }
     this.object = null;
-    this.grid.scale.setScalar(1);
-    this.grid.position.set(0, 0, 0);
     this.reset();
   }
 
@@ -100,9 +94,6 @@ export class SceneViewer {
     object.position.sub(center);
     this.object = object;
     this.scene.add(object);
-    const extent = Math.max(size.x, size.y, size.z, 0.001);
-    this.grid.scale.setScalar(extent / 15);
-    this.grid.position.y = -size.y / 2 - extent * 0.002;
     this.setPointSize(this.pointSize);
     this.reset();
     return true;
@@ -132,14 +123,11 @@ export class SceneViewer {
       }
     });
   }
-  setGrid(visible) { this.grid.visible = visible; }
   setLight(light) { this.scene.background = new THREE.Color(light ? '#e8ede9' : '#141e21'); }
   dispose() {
     this.clear();
     this.observer.disconnect();
     this.controls.dispose();
-    this.grid.geometry.dispose();
-    this.grid.material.dispose();
     this.renderer.setAnimationLoop(null);
     this.renderer.dispose();
   }

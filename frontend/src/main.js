@@ -13,7 +13,6 @@ const icons = {
   play: '<path d="m8 4 12 8-12 8V4Z"/>',
   refresh: '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 6a8 8 0 0 1 13 3M5 15a8 8 0 0 0 13 3"/>',
   reset: '<path d="m3 10 9-7 9 7v11h-6v-7H9v7H3V10Z"/>',
-  grid: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/>',
   expand: '<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/>',
   download: '<path d="M12 3v12m-5-5 5 5 5-5M3 17v4h18v-4"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
@@ -83,9 +82,9 @@ document.querySelector('#app').innerHTML = `
       <section class="viewer-shell" id="viewer-shell" aria-label="三维结果查看器">
         <div class="viewer-top"><div class="viewer-status"><span class="status-dot"></span><span id="viewer-caption">工作空间已就绪</span></div><span class="projection">透视视图</span></div>
         <div class="canvas-host" id="canvas-host"></div>
-        <div class="viewport-empty" id="viewport-empty"><span class="empty-cube">${icon('cube')}</span><p class="empty-kicker">YOUR NEXT PERSPECTIVE</p><h3 id="empty-title">让每一帧，拥有新的维度</h3><p id="empty-message">导入航拍影像，开始一次三维重建。<br />生成的模型将在这里呈现。</p><button type="button" class="viewport-cta" id="viewport-upload">导入第一组影像 ${icon('arrow')}</button><span class="grid-note">参考网格 · 当前无重建结果</span></div>
+        <div class="viewport-empty" id="viewport-empty"><span class="empty-cube">${icon('cube')}</span><p class="empty-kicker">YOUR NEXT PERSPECTIVE</p><h3 id="empty-title">让每一帧，拥有新的维度</h3><p id="empty-message">导入航拍影像，开始一次三维重建。<br />生成的模型将在这里呈现。</p><button type="button" class="viewport-cta" id="viewport-upload">导入第一组影像 ${icon('arrow')}</button></div>
         <div class="viewer-notice" id="viewer-notice" role="status" hidden></div>
-        <div class="viewer-tools" role="toolbar" aria-label="视图控制"><button type="button" id="reset-view" title="重置视角" aria-label="重置视角">${icon('reset')}</button><span></span><button type="button" id="toggle-grid" title="显示参考网格" aria-label="显示参考网格" aria-pressed="true">${icon('grid')}</button><button type="button" id="toggle-background" title="切换浅色背景" aria-label="切换浅色背景" aria-pressed="false">${icon('sun')}</button><span></span><button type="button" id="fullscreen" title="全屏查看" aria-label="全屏查看">${icon('expand')}</button></div>
+        <div class="viewer-tools" role="toolbar" aria-label="视图控制"><button type="button" id="reset-view" title="重置视角" aria-label="重置视角">${icon('reset')}</button><span></span><button type="button" id="toggle-background" title="切换浅色背景" aria-label="切换浅色背景" aria-pressed="false">${icon('sun')}</button><span></span><button type="button" id="fullscreen" title="全屏查看" aria-label="全屏查看">${icon('expand')}</button></div>
         <div class="viewer-bottom"><span class="navigation-hint"><span>拖动</span> 旋转 <b>·</b> <span>滚轮</span> 缩放 <b>·</b> <span>右键</span> 平移</span><label class="point-control" for="point-size">点大小<input id="point-size" type="range" min="0.001" max="0.1" value="0.025" step="0.001" /></label><span class="axis-symbol" aria-hidden="true"><i>Z</i><i>Y</i><i>X</i></span></div>
       </section>
       <section class="task-card" aria-label="当前任务详情"><div class="task-detail-top"><div class="current-task-title"><span class="section-tick"></span><h3>当前任务</h3><span id="job-badge" role="status" aria-live="polite" class="badge neutral">未选择</span></div><div class="detail-actions"><button type="button" class="text-button" id="refresh-job" disabled>${icon('refresh')}刷新</button><button type="button" class="retry-button" id="retry-job" hidden>${icon('refresh')}<span>重新提交</span></button><button type="button" class="cancel-button" id="cancel-job" hidden>${icon('close')}取消任务</button></div></div><div id="job-detail" class="job-detail"><p class="muted">任务启动后，可在这里查看实时阶段、日志与输出文件。</p></div><div id="job-error" class="inline-error job-error" role="alert" hidden></div><div id="outputs" class="outputs" hidden></div><details id="logs-panel" class="logs-panel"><summary><span>${icon('terminal')}运行日志<span class="log-note" id="log-note">选择任务后可查看</span></span><span class="log-expand">展开</span></summary><pre id="job-logs" tabindex="0" aria-label="任务运行日志">尚未选择任务</pre></details></section>
@@ -466,7 +465,6 @@ $('refresh-all').addEventListener('click', refresh); $('refresh-history').addEve
 $('logs-panel').addEventListener('toggle', loadLogs);
 $('viewport-upload').addEventListener('click', () => { selectSource('upload'); $('file-input').click(); });
 $('reset-view').addEventListener('click', () => state.viewer?.reset());
-$('toggle-grid').addEventListener('click', event => { const button = event.currentTarget; const visible = button.getAttribute('aria-pressed') !== 'true'; button.setAttribute('aria-pressed', String(visible)); state.viewer?.setGrid(visible); });
 $('toggle-background').addEventListener('click', event => { const button = event.currentTarget; const light = button.getAttribute('aria-pressed') !== 'true'; button.setAttribute('aria-pressed', String(light)); state.viewer?.setLight(light); $('viewer-shell').classList.toggle('light-view', light); });
 $('point-size').addEventListener('input', event => state.viewer?.setPointSize(event.target.value));
 $('fullscreen').addEventListener('click', async () => {
