@@ -21,12 +21,13 @@ from matplotlib import font_manager
 RESULT = sys.argv[1] if len(sys.argv) > 1 else "/home/zimeng/rebuild_drone_agent/data/result/workbench/a8b1d229d36c4558bcf4c3293fd0b59b/20261114_213843_537471"
 OUT = sys.argv[2] if len(sys.argv) > 2 else "/home/zimeng/rebuild_drone_agent/data/result/report_figures"
 
-GREEN_DARK = "#254b3d"
-GREEN = "#5c8a6f"
-GREEN_LIGHT = "#a8c3b2"
+# HIT blue palette, matching the school deck (bottom bar #005375).
+GREEN_DARK = "#005375"
+GREEN = "#2e75b6"
+GREEN_LIGHT = "#9dc3d4"
 SAND = "#c9a86a"
-GREY = "#8a948e"
-INK = "#2c3d31"
+GREY = "#6b7a85"
+INK = "#1a2b33"
 
 # Chinese glyphs need a CJK face; fall back to an English deck if absent.
 for candidate in ["/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
@@ -37,9 +38,9 @@ for candidate in ["/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         plt.rcParams["font.family"] = font_manager.FontProperties(fname=candidate).get_name()
         break
 plt.rcParams.update({
-    "axes.edgecolor": "#d8ded3", "axes.labelcolor": INK, "text.color": INK,
+    "axes.edgecolor": "#d5dde3", "axes.labelcolor": INK, "text.color": INK,
     "xtick.color": GREY, "ytick.color": GREY, "axes.grid": True,
-    "grid.color": "#e8ece3", "grid.linewidth": 0.8, "figure.dpi": 200,
+    "grid.color": "#e8eef2", "grid.linewidth": 0.8, "figure.dpi": 200,
     "savefig.bbox": "tight", "savefig.facecolor": "white",
 })
 
