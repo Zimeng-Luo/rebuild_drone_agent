@@ -240,7 +240,16 @@ function renderSelected() {
   showError('job-error', job?.error ? friendlyError(job.error) : '');
   if (!job) { updateStart(); return; }
   const statusSentence = active(job) ? jobPhase(job) : job.status === 'completed' ? '重建完成，点击下方“查看”后加载模型。' : job.status === 'failed' ? '任务执行失败，可检查日志后重新提交。' : job.status === 'interrupted' ? '任务已中断，可复用原输入与参数重新提交。' : '任务已取消，可重新提交为新任务。';
-  $('job-detail').innerHTML = `<div class="stage-line ${job.status === 'running' && job.started_at ? 'is-active' : ''}"><span class="stage-dot"></span><strong>${esc(statusSentence)}</strong></div><div class="job-metadata"><span>创建 <b>${esc(stamp(job.created_at))}</b></span><span>开始 <b>${esc(job.status === 'queued' ? '尚未开始' : stamp(job.started_at))}</b></span><span>结束 <b>${esc(stamp(job.finished_at))}</b></span>${job.status === 'running' ? `<span>运行设备 <b>GPU ${esc(job.gpu_device ?? '分配中')}</b></span>` : ''}${job.retry_of ? `<span>重试来源 <b>${esc(job.retry_of)}</b></span>` : ''}</div><p class="input-reference" title="${esc(job.input_path)}">${icon('folder')}<span>${esc(job.input_path)}</span></p>${summaryAvailable(job) ? summarySection(job.summary) : ''}`;
+  // The detail panel is rebuilt from the polled snapshot, which would collapse
+  // an expanded digest every few seconds; remember the open panels and restore.
+  const detail = $('job-detail');
+  const panels = ['.summary-data', '.metric-steps'];
+  const opened = panels.map(selector => Boolean(detail.querySelector(`${selector}[open]`)));
+  detail.innerHTML = `<div class="stage-line ${job.status === 'running' && job.started_at ? 'is-active' : ''}"><span class="stage-dot"></span><strong>${esc(statusSentence)}</strong></div><div class="job-metadata"><span>创建 <b>${esc(stamp(job.created_at))}</b></span><span>开始 <b>${esc(job.status === 'queued' ? '尚未开始' : stamp(job.started_at))}</b></span><span>结束 <b>${esc(stamp(job.finished_at))}</b></span>${job.status === 'running' ? `<span>运行设备 <b>GPU ${esc(job.gpu_device ?? '分配中')}</b></span>` : ''}${job.retry_of ? `<span>重试来源 <b>${esc(job.retry_of)}</b></span>` : ''}</div><p class="input-reference" title="${esc(job.input_path)}">${icon('folder')}<span>${esc(job.input_path)}</span></p>${summaryAvailable(job) ? summarySection(job.summary) : ''}`;
+  panels.forEach((selector, index) => {
+    const panel = detail.querySelector(selector);
+    if (panel) panel.open = opened[index];
+  });
   const outputs = (job.outputs || []).filter(output => safeUrl(output.url));
   const outputSignature = JSON.stringify(outputs) + job.id;
   if (renderSelected.outputSignature !== outputSignature) {

@@ -9,10 +9,31 @@ const source = await readFile(new URL('../src/main.js', import.meta.url), 'utf8'
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 class Element {
   constructor() { this.hidden = false; this.disabled = false; this.value = ''; this.dataset = {}; this.listeners = {}; this.children = []; this.textContent = ''; this.attributes = {}; this.classList = { add() {}, remove() {}, toggle() {} }; }
-  set innerHTML(html) { this.html = html; this.buttons = [...html.matchAll(/data-output-index="(\d+)"/g)].map(match => { const button = new Element(); button.dataset.outputIndex = match[1]; return button; }); }
+  set innerHTML(html) {
+    this.html = html;
+    this.buttons = [...html.matchAll(/data-output-index="(\d+)"/g)].map(match => { const button = new Element(); button.dataset.outputIndex = match[1]; return button; });
+    // Track the collapsed/expanded state of <details> panels so the workbench can
+    // be tested for preserving them across re-renders.
+    this.panels = new Map();
+    for (const match of html.matchAll(/<details class="([\w-]+)"([^>]*)>/g)) this.panels.set(match[1], /(^|\s)open(\s|$|=)/.test(match[2]));
+  }
   get innerHTML() { return this.html || ''; }
   addEventListener(name, callback) { this.listeners[name] = callback; }
-  querySelector() { return this.span ||= new Element(); }
+  querySelector(selector) {
+    const panel = /^\.([\w-]+)(\[open\])?$/.exec(selector);
+    if (panel) {
+      if (!this.panels || !this.panels.has(panel[1])) return null;
+      if (panel[2] && !this.panels.get(panel[1])) return null;
+      this.panelNodes ||= new Map();
+      if (!this.panelNodes.has(panel[1])) {
+        const host = this;
+        const name = panel[1];
+        this.panelNodes.set(name, { get open() { return Boolean(host.panels.get(name)); }, set open(value) { host.panels.set(name, Boolean(value)); } });
+      }
+      return this.panelNodes.get(panel[1]);
+    }
+    return this.span ||= new Element();
+  }
   querySelectorAll(selector) { return selector === '.view-output' ? this.buttons || [] : []; }
   setAttribute(key, value) { this.attributes[key] = value; }
   append(...nodes) { this.children.push(...nodes); }
@@ -218,4 +239,53 @@ test("list entries that only advertise has_summary keep the previously loaded di
   await ui.loadJobs();
   assert.match(ui.element("job-detail").innerHTML, /summary-data/);
   assert.equal(ui.state.selected.summary.time.total.duration_seconds, 30);
+});
+
+test('an expanded digest survives the poll-driven re-render instead of collapsing', () => {
+  const summary = {
+    time: { total: { duration_seconds: 466.008 }, steps: [
+      { name: 'data_preprocess', duration_seconds: 141.829 },
+      { name: 'rebuild_chunks', duration_seconds: 26.173 },
+      { name: 'align_and_merge', duration_seconds: 297.602 },
+      { name: 'key_frame_select_global', duration_seconds: 12.912 }
+    ] },
+    frames: { sampled: 387, selected: 81 },
+    chunks: { count: 5 }
+  };
+  const done = job('done', 'completed', { summary });
+  const ui = workbench(async () => ({ jobs: [done] }));
+  ui.state.jobs = [done]; ui.state.selected = done; ui.state.selectedId = done.id;
+
+  // First render leaves both panels collapsed, as the markup does.
+  ui.renderSelected();
+  assert.equal(ui.element('job-detail').panels.get('summary-data'), false);
+  assert.equal(ui.element('job-detail').panels.get('metric-steps'), false);
+
+  // The user opens the digest while the page keeps polling.
+  ui.element('job-detail').panels.set('summary-data', true);
+
+  // A poll tick rebuilds the whole panel from the snapshot.
+  ui.renderSelected();
+  assert.equal(ui.element('job-detail').panels.get('summary-data'), true, 'expanded digest must stay open');
+  assert.equal(ui.element('job-detail').panels.get('metric-steps'), false);
+
+  // Closing it again must also stick.
+  ui.element('job-detail').panels.set('summary-data', false);
+  ui.renderSelected();
+  assert.equal(ui.element('job-detail').panels.get('summary-data'), false);
+});
+
+test('a job without a digest never resurrects a stale open panel from the previous selection', () => {
+  const withDigest = job('a', 'completed', { summary: { time: { total: { duration_seconds: 30 } } } });
+  const plain = job('b', 'completed');
+  const ui = workbench(async () => ({ jobs: [withDigest, plain] }));
+  ui.state.jobs = [withDigest]; ui.state.selected = withDigest; ui.state.selectedId = withDigest.id;
+  ui.renderSelected();
+  ui.element('job-detail').panels.set('summary-data', true);
+  ui.renderSelected();
+  assert.equal(ui.element('job-detail').panels.get('summary-data'), true);
+
+  ui.state.selected = plain; ui.state.selectedId = plain.id;
+  ui.renderSelected();
+  assert.equal(ui.element('job-detail').panels.has('summary-data'), false);
 });
