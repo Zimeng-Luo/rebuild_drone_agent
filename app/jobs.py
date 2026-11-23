@@ -218,11 +218,18 @@ class JobManager:
     def _save(self, job: dict) -> None:
         atomic_json(self.jobs_dir / job["id"] / "job.json", job)
 
-    def _snapshot(self, job: dict) -> dict:
+    def _snapshot(self, job: dict, include_summary: bool = True) -> dict:
         result = copy.deepcopy(job)
         result["queue_position"] = self.pending.index(job["id"]) + 1 if job["id"] in self.pending else None
         result.setdefault("gpu_device", None)
         result.setdefault("retry_of", None)
+        summary = result.get("summary")
+        result["has_summary"] = bool(isinstance(summary, dict) and summary)
+        if not include_summary:
+            # A completed task writes a multi-kilobyte diagnostics document
+            # (per-step timings, cleanup lists, full parameter dump). The list
+            # view never renders it, so only the detail endpoint ships it.
+            result["summary"] = None
         return result
 
     def submit(self, input_path: str, read_type: str, name: str, options: dict,
@@ -386,7 +393,7 @@ class JobManager:
 
     def list(self) -> list[dict]:
         with self.lock:
-            return [self._snapshot(job) for job in sorted(self.jobs.values(), key=lambda job: job["created_at"], reverse=True)]
+            return [self._snapshot(job, include_summary=False) for job in sorted(self.jobs.values(), key=lambda job: job["created_at"], reverse=True)]
 
     def cancel(self, job_id: str, interrupted: bool = False) -> dict:
         with self.lock:

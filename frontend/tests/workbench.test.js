@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 import * as helpers from '../src/api.js';
+import * as summaryHelpers from '../src/summary.js';
 
 const source = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -22,7 +23,7 @@ function workbench(api) {
   const nodes = new Map();
   const element = id => { if (!nodes.has(id)) nodes.set(id, new Element()); return nodes.get(id); };
   const context = {
-    ...helpers, active: helpers.isActive, api,
+    ...helpers, ...summaryHelpers, active: helpers.isActive, api,
     safeUrl: value => typeof value === 'string' && value.startsWith('/') ? `http://localhost${value}` : null,
     document: { hidden: false, getElementById: element, querySelector: () => element('app'), querySelectorAll: selector => [...selector.matchAll(/#([\w-]+)/g)].map(match => element(match[1])), addEventListener() {}, createElement: () => new Element() },
     localStorage: { getItem: () => null, setItem() {} },
@@ -166,4 +167,55 @@ test('history, refresh and selection never load a model; explicit clicks coalesc
   assert.equal(loads, 1); assert.equal(ui.element('canvas-host').hidden, true);
   ui.element('outputs').querySelectorAll('.view-output')[0].listeners.click();
   assert.equal(loads, 1); assert.equal(ui.element('canvas-host').hidden, false);
+});
+
+test('summary digest renders once per refresh instead of appending a new block every poll', async () => {
+  const result = job('done', 'completed', {
+    summary: { time: { total: { duration_seconds: 466.008 }, steps: [
+      { name: 'data_preprocess', duration_seconds: 141.829 },
+      { name: 'rebuild_chunks', duration_seconds: 26.173 },
+      { name: 'align_and_merge', duration_seconds: 297.602 }
+    ] }, parameters: { run_evidence: { preprocess: { sampled_frame_count: 387, selected_frame_count: 81, chunk_count: 5, per_chunk_frame_counts: [30, 30, 30, 30, 21] }, alignment: { mode: 'loop_optimized', loop_candidate_count: 3, loop_accepted_count: 3 } } }, space: { total_mb: 1086.8, by_suffix: { '.npz': { mb: 704.743 } } } }
+  });
+  const ui = workbench(async () => result);
+  ui.state.jobs = [result]; ui.state.selected = result; ui.state.selectedId = result.id;
+  ui.renderSelected();
+  const first = ui.element('job-detail').innerHTML;
+  ui.renderSelected(); ui.renderSelected();
+  const third = ui.element('job-detail').innerHTML;
+  assert.equal(first, third);
+  assert.equal((third.match(/class="summary-data"/g) || []).length, 1);
+  assert.doesNotMatch(third, /"duration_seconds"/);
+  assert.match(third, /7 分 46 秒/);
+  assert.match(third, /81<small> \/ 387<\/small>/);
+  assert.match(third, /loop_optimized/);
+});
+
+test('a job without a digest renders no summary block and never breaks the detail view', async () => {
+  const plain = job('plain', 'running');
+  const ui = workbench(async () => plain);
+  ui.state.jobs = [plain]; ui.state.selected = plain; ui.state.selectedId = plain.id;
+  ui.renderSelected();
+  assert.doesNotMatch(ui.element('job-detail').innerHTML, /summary-data/);
+});
+
+test("list entries that only advertise has_summary keep the previously loaded digest", async () => {
+  // The detail endpoint carries the digest; the list endpoint only advertises it.
+  const full = job("done", "completed", { summary: { time: { total: { duration_seconds: 30 } } } });
+  const listed = { ...full, summary: null, has_summary: true };
+  const ui = workbench(async path => (path === "/jobs/done" ? full : { jobs: [listed] }));
+  ui.state.jobs = [full]; ui.state.selected = full; ui.state.selectedId = full.id;
+  ui.renderSelected();
+  assert.match(ui.element("job-detail").innerHTML, /summary-data/);
+
+  // A lean list entry must not drop the digest already held for the same job
+  // while its detail request is still in flight.
+  ui.state.jobs = [listed]; ui.state.selectedId = null;
+  const pending = ui.selectJob("done");
+  assert.match(ui.element("job-detail").innerHTML, /summary-data/);
+  await pending;
+
+  await ui.loadJobs();
+  assert.match(ui.element("job-detail").innerHTML, /summary-data/);
+  assert.equal(ui.state.selected.summary.time.total.duration_seconds, 30);
 });

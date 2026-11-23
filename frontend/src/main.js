@@ -1,5 +1,6 @@
 import './style.css';
 import { api, formatBytes, safeUrl, isActive as active, canRetry, schedulerState, submissionState, jobPhase, shouldPollFast, modelKey, previewAction, friendlyError } from './api.js';
+import { summaryTotal, summaryPhases, summaryBreakdown, summaryFrames, summaryChunks, summarySpace, summaryPeaks, summaryLoop, summaryAvailable } from './summary.js';
 
 const icons = {
   mark: '<path d="m4 19 8-15 8 15-8-5-8 5Z"/><path d="M12 4v10"/>',
@@ -184,6 +185,40 @@ function acceptFiles(files) {
   updateStart();
 }
 
+function metricBar(share) {
+  const percent = Math.max(0, Math.min(1, Number(share) || 0)) * 100;
+  return `<span class="metric-bar" aria-hidden="true"><i style="width:${percent.toFixed(1)}%"></i></span>`;
+}
+function duration(value) {
+  if (value == null) return '—';
+  if (value < 60) return `${value.toFixed(1)} 秒`;
+  const minutes = Math.floor(value / 60);
+  return `${minutes} 分 ${(value - minutes * 60).toFixed(0)} 秒`;
+}
+function summarySection(summary) {
+  const total = summaryTotal(summary);
+  const phases = summaryPhases(summary);
+  const breakdown = summaryBreakdown(summary, 6);
+  const frames = summaryFrames(summary);
+  const chunks = summaryChunks(summary);
+  const space = summarySpace(summary);
+  const peaks = summaryPeaks(summary);
+  const loop = summaryLoop(summary);
+  if (total == null && !phases.length && !frames && !space) return '';
+  const cards = [
+    ['总耗时', duration(total)],
+    frames ? ['关键帧', `${frames.selected ?? '—'}<small> / ${frames.sampled ?? '—'}</small>`, frames.retention == null ? '' : `保留率 ${(frames.retention * 100).toFixed(1)}%`] : null,
+    chunks.count ? ['影像分块', `${chunks.count}<small> 块</small>`, chunks.perChunk.length ? `每块 ${chunks.perChunk.join(' / ')} 帧` : ''] : null,
+    space ? ['产物体积', `${Number(space.totalMb).toFixed(1)}<small> MB</small>`, ''] : null
+  ].filter(Boolean);
+  const phaseRows = phases.map(phase => `<li><span class="metric-label">${esc(phase.label)}<small>${esc(phase.hint)}</small></span>${metricBar(phase.share)}<span class="metric-value">${duration(phase.seconds)}<small>${phase.share == null ? '' : `${(phase.share * 100).toFixed(1)}%`}</small></span></li>`).join('');
+  const stepRows = breakdown.length ? `<details class="metric-steps"><summary>最耗时的 ${breakdown.length} 个步骤</summary><ul>${breakdown.map(step => `<li><span class="metric-label"><code>${esc(step.name)}</code></span>${metricBar(step.share)}<span class="metric-value">${duration(step.seconds)}</span></li>`).join('')}</ul></details>` : '';
+  const spaceRows = space?.groups?.length ? `<div class="metric-suffixes">${space.groups.map(group => `<span><b>${esc(group.suffix)}</b>${Number(group.mb).toFixed(1)} MB</span>`).join('')}</div>` : '';
+  const peaksLine = peaks ? `峰值：${[peaks.gpuMb != null ? `显存 ${Number(peaks.gpuMb).toFixed(0)} MB` : null, peaks.rssMb != null ? `内存 ${Number(peaks.rssMb).toFixed(0)} MB` : null, peaks.cpuPercent != null ? `CPU ${Number(peaks.cpuPercent).toFixed(0)}%` : null].filter(Boolean).join(' · ')}` : '';
+  const loopLine = loop ? `拼接模式 ${loop.mode || '—'}${loop.candidates == null ? '' : ` · 回环候选 ${loop.candidates} 组，接受 ${loop.accepted ?? 0} 组`}${loop.verified ? '' : ' · 未做独立精度验证'}` : '';
+  return `<details class="summary-data"><summary>重建摘要 <span>${duration(total)}${frames ? ` · ${frames.selected ?? '—'} 帧` : ''}${chunks.count ? ` · ${chunks.count} 块` : ''}</span></summary><div class="summary-card"><div class="metric-cards">${cards.map(([label, value, hint]) => `<div class="metric-card"><span>${esc(label)}</span><strong>${value}</strong>${hint ? `<small>${esc(hint)}</small>` : ''}</div>`).join('')}</div>${phaseRows ? `<ul class="metric-phases">${phaseRows}</ul>` : ''}${stepRows}${spaceRows}${peaksLine ? `<p class="metric-peaks">${esc(peaksLine)}</p>` : ''}${loopLine ? `<p class="metric-peaks">${esc(loopLine)}</p>` : ''}</div></details>`;
+}
+
 function renderJobs() {
   $('history-count').textContent = `${state.jobs.length} 个任务`;
   const signature = JSON.stringify(state.jobs.map(job => [job.id, job.name, job.status, job.stage, job.created_at, job.started_at, job.queue_position, job.gpu_device])) + state.selectedId;
@@ -205,25 +240,19 @@ function renderSelected() {
   showError('job-error', job?.error ? friendlyError(job.error) : '');
   if (!job) { updateStart(); return; }
   const statusSentence = active(job) ? jobPhase(job) : job.status === 'completed' ? '重建完成，点击下方“查看”后加载模型。' : job.status === 'failed' ? '任务执行失败，可检查日志后重新提交。' : job.status === 'interrupted' ? '任务已中断，可复用原输入与参数重新提交。' : '任务已取消，可重新提交为新任务。';
-  $('job-detail').innerHTML = `<div class="stage-line ${job.status === 'running' && job.started_at ? 'is-active' : ''}"><span class="stage-dot"></span><strong>${esc(statusSentence)}</strong></div><div class="job-metadata"><span>创建 <b>${esc(stamp(job.created_at))}</b></span><span>开始 <b>${esc(job.status === 'queued' ? '尚未开始' : stamp(job.started_at))}</b></span><span>结束 <b>${esc(stamp(job.finished_at))}</b></span>${job.status === 'running' ? `<span>运行设备 <b>GPU ${esc(job.gpu_device ?? '分配中')}</b></span>` : ''}${job.retry_of ? `<span>重试来源 <b>${esc(job.retry_of)}</b></span>` : ''}</div><p class="input-reference" title="${esc(job.input_path)}">${icon('folder')}<span>${esc(job.input_path)}</span></p>`;
+  $('job-detail').innerHTML = `<div class="stage-line ${job.status === 'running' && job.started_at ? 'is-active' : ''}"><span class="stage-dot"></span><strong>${esc(statusSentence)}</strong></div><div class="job-metadata"><span>创建 <b>${esc(stamp(job.created_at))}</b></span><span>开始 <b>${esc(job.status === 'queued' ? '尚未开始' : stamp(job.started_at))}</b></span><span>结束 <b>${esc(stamp(job.finished_at))}</b></span>${job.status === 'running' ? `<span>运行设备 <b>GPU ${esc(job.gpu_device ?? '分配中')}</b></span>` : ''}${job.retry_of ? `<span>重试来源 <b>${esc(job.retry_of)}</b></span>` : ''}</div><p class="input-reference" title="${esc(job.input_path)}">${icon('folder')}<span>${esc(job.input_path)}</span></p>${summaryAvailable(job) ? summarySection(job.summary) : ''}`;
   const outputs = (job.outputs || []).filter(output => safeUrl(output.url));
   const outputSignature = JSON.stringify(outputs) + job.id;
   if (renderSelected.outputSignature !== outputSignature) {
     renderSelected.outputSignature = outputSignature;
     $('outputs').hidden = outputs.length === 0;
-    $('outputs').innerHTML = outputs.map((output, index) => `<div class="output-file">${icon(/\.(glb|ply)$/i.test(output.name) ? 'cube' : 'folder')}<span><strong>${esc(output.name)}</strong><small>${formatBytes(output.size_bytes)}</small></span>${/\.(glb|ply)$/i.test(output.name) ? `<button type="button" class="text-button view-output" data-output-index="${index}">查看</button>` : ''}<a href="${esc(safeUrl(output.url))}" download="${esc(output.name)}" class="download-button" aria-label="下载 ${esc(output.name)}" title="下载 ${esc(output.name)}">${icon('download')}</a></div>`).join('');
+    $('outputs').innerHTML = outputs.map((output, index) => `<div class="output-file">${icon(/\.(glb|ply)$/i.test(output.name) ? 'cube' : 'folder')}<span title="${esc(output.name)}"><strong>${esc(output.name.split("/").pop())}</strong><small>${formatBytes(output.size_bytes)}</small></span>${/\.(glb|ply)$/i.test(output.name) ? `<button type="button" class="text-button view-output" data-output-index="${index}">查看</button>` : ''}<a href="${esc(safeUrl(output.url))}" download="${esc(output.name)}" class="download-button" aria-label="下载 ${esc(output.name)}" title="下载 ${esc(output.name)}">${icon('download')}</a></div>`).join('');
     $('outputs').querySelectorAll('.view-output').forEach(button => button.addEventListener('click', () => {
       const output = outputs[Number(button.dataset.outputIndex)];
       state.previewUrl = output.url;
       state.requestedKey = modelKey(job.id, output);
       loadModel(output);
     }));
-  }
-  if (job.summary && Object.keys(job.summary).length) {
-    const details = document.createElement('details'); details.className = 'summary-data';
-    const summary = document.createElement('summary'); summary.textContent = '重建摘要';
-    const pre = document.createElement('pre'); pre.textContent = JSON.stringify(job.summary, null, 2);
-    details.append(summary, pre); $('job-detail').appendChild(details);
   }
   const models = outputs.filter(output => /\.(glb|ply)$/i.test(output.name));
   const preview = models.find(output => modelKey(job.id, output) === state.requestedKey);
@@ -310,7 +339,10 @@ async function selectJob(id) {
   const changed = state.selectedId !== id;
   state.selectedId = id;
   try { localStorage.setItem('aeroscape.selected-job', id); } catch { /* Optional persistence. */ }
-  state.selected = state.jobs.find(job => job.id === id) || null;
+  const listed = state.jobs.find(job => job.id === id) || null;
+  // The list endpoint omits the diagnostics payload; keep the summary we
+  // already hold for this same job so the digest does not flicker on refresh.
+  state.selected = listed ? { ...listed, summary: listed.summary ?? (state.selected?.id === id ? state.selected.summary : null) } : null;
   if (changed) { state.requestedKey = null; state.previewUrl = null; $('canvas-host').hidden = true; }
   $('viewer-notice').hidden = true; $('job-logs').textContent = '正在读取日志…';
   if (state.selected) renderSelected();
