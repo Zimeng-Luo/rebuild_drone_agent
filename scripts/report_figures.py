@@ -125,7 +125,7 @@ hi = np.percentile(flat, 99, axis=0)
 mid = (lo + hi) / 2
 half = np.max(hi - lo) / 2
 fig = plt.figure(figsize=(7.2, 3.5))
-for index, (elev, azim, title) in enumerate([(26, -62, "俯视三分之四视角"), (2, -90, "水平侧视")]):
+for index, (elev, azim, title) in enumerate([(26, -62, "俯视四分之三视角"), (2, -90, "水平侧视")]):
     ax = fig.add_subplot(1, 2, index + 1, projection="3d")
     step = 2 if index == 0 else 3
     ax.scatter(flat[::step, 0], flat[::step, 1], flat[::step, 2], c=rgb[::step], s=1.1, linewidths=0, alpha=0.9)
